@@ -8,6 +8,7 @@ from typing import List, Tuple
 from tqdm import tqdm
 import math
 from torch.utils.data import Dataset
+import multiprocessing # Added for multiprocessing
 
 # Imports that were in the same cell block in the notebook, included for completeness,
 # though not all are directly used by MyDataset.
@@ -16,47 +17,101 @@ import random
 import sklearn.preprocessing as skp
 from functools import lru_cache
 
+# Top-level worker function for multiprocessing
+def _mp_worker_graph_generation_task(
+    i_graph_idx: int,
+    graph_file_path: str,
+    current_window_dates_str_slice: List[str],
+    # stock_data_df: pd.DataFrame, # Passed via my_dataset_instance
+    comlist: List[str],
+    market: str,
+    window: int,
+    # feature_columns: List[str], # Accessed via my_dataset_instance.node_feature_matrix
+    my_dataset_instance: 'MyDataset' # Pass the instance to call its methods
+) -> Tuple[int, str, str]: # Returns (index, status, path_or_error)
+    """
+    Worker function to generate a single graph file.
+    """
+    if os.path.exists(graph_file_path):
+        return i_graph_idx, "skipped_exists", graph_file_path
+
+    try:
+        # X_features will have shape (num_features, num_companies, window + 1)
+        X_features_full_window = my_dataset_instance.node_feature_matrix(
+            current_window_dates_str_slice, 
+            comlist, # Use the comlist specific to this graph generation task (passed from _create_graphs)
+            market
+        )
+        
+        if X_features_full_window.shape[2] != window + 1:
+            return i_graph_idx, "error_feature_matrix_shape", f"Node feature matrix for graph {i_graph_idx} has incorrect time steps: {X_features_full_window.shape[2]}, expected {window + 1}"
+
+        C_labels = torch.zeros(X_features_full_window.shape[1]) # Labels based on number of companies
+
+        close_price_feature_idx = 3 # Assuming 'Close' is the 4th feature (0-indexed)
+        for company_idx in range(C_labels.shape[0]):
+            last_day_close = X_features_full_window[close_price_feature_idx, company_idx, -1]
+            prev_day_close = X_features_full_window[close_price_feature_idx, company_idx, -2]
+            
+            if last_day_close != 0 and prev_day_close != 0:
+                if last_day_close > prev_day_close:
+                    C_labels[company_idx] = 1
+        
+        X_processed = X_features_full_window[:, :, :-1].clone()
+
+        for k_feature_idx in range(X_processed.shape[0]):
+            X_processed[k_feature_idx] = torch.Tensor(np.log1p(X_processed[k_feature_idx].numpy()))
+
+        A_adj = torch.zeros((X_processed.shape[0], X_processed.shape[1], X_processed.shape[1]))
+        for l_feature_idx in range(A_adj.shape[0]):
+            A_adj[l_feature_idx] = my_dataset_instance.adjacency_matrix(X_processed[l_feature_idx]) 
+        
+        torch.save({'X': X_processed, 'A': A_adj, 'Y': C_labels}, graph_file_path)
+        return i_graph_idx, "success", graph_file_path
+    except Exception as e:
+        # Log error or handle as appropriate
+        # print(f"Error generating graph {i_graph_idx} ({graph_file_path}): {e}")
+        return i_graph_idx, "error_exception", f"Exception for graph {i_graph_idx}: {str(e)}"
+
 
 class MyDataset(Dataset):
     def __init__(self, root_csv_path: str, desti: str, market: str, comlist: List[str], start: str, end: str, window: int, dataset_type: str):
         print("--- DEBUG: MyDataset __init__ ENTERED ---") # Very simple debug print
         super().__init__()
 
-        self.comlist = comlist
+        self.comlist = comlist # This is the overall list of companies for the dataset instance
         self.market = market
         self.root_csv_path = root_csv_path
         self.desti = desti
-        self.start_str = start # Store original string for directory naming
-        self.end_str = end     # Store original string for directory naming
+        self.start_str = start 
+        self.end_str = end     
         self.window = window
-        self.dataset_type = dataset_type # Initialize dataset_type earlier
+        self.dataset_type = dataset_type 
         
         # Load the CSV and prepare the MultiIndex DataFrame
         try:
-            # Attempt to read the first line to check for headers vs data
             with open(self.root_csv_path, 'r') as f:
                 first_line = f.readline().strip()
             
-            # Heuristic: if the first item in the CSV looks like a ticker from comlist, assume no header
-            # This is a simplified check. A more robust check might involve trying to parse dates, numbers etc.
             looks_like_data = False
             if first_line:
                 first_item = first_line.split(',')[0].strip('"').strip("'")
-                if first_item in comlist:
+                if first_item in self.comlist: # Use self.comlist for initial check
                     looks_like_data = True
             
             expected_column_names = ['Ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-            # If the user's CSV has more columns like the example, we'll need to adjust.
-            # The example had 10 columns: Ticker,Date,Open,High,Low,Close,Volume,Adj Close,OriginalDate,AnotherDate
-            # We will select the ones we need.
+            # user_example_cols defines the full potential set of columns if the headerless CSV is wide.
+            # We will only use the ones in expected_column_names.
             user_example_cols = ['Ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'AdjClose', 'OriginalDate1', 'OriginalDate2']
 
-
             if looks_like_data:
-                raw_df = pd.read_csv(self.root_csv_path, header=None, names=user_example_cols, low_memory=False)
+                # If headerless, provide names for all potential columns in user_example_cols,
+                # but only load those specified in expected_column_names.
+                # This assumes the order of columns in expected_column_names matches the
+                # first N columns of user_example_cols if the CSV is headerless.
+                raw_df = pd.read_csv(self.root_csv_path, header=None, names=user_example_cols, usecols=expected_column_names, low_memory=False)
             else:
                 raw_df = pd.read_csv(self.root_csv_path, low_memory=False)
-                # Attempt to standardize column names if headers are present
                 rename_map = {}
                 for col in raw_df.columns:
                     col_s = str(col).strip().lower()
@@ -65,29 +120,36 @@ class MyDataset(Dataset):
                     elif col_s == 'open': rename_map[col] = 'Open'
                     elif col_s == 'high': rename_map[col] = 'High'
                     elif col_s == 'low': rename_map[col] = 'Low'
-                    elif col_s == 'close' or col_s == 'closeadj': rename_map[col] = 'Close' # Added 'closeadj'
+                    elif col_s == 'close' or col_s == 'closeadj': rename_map[col] = 'Close'
                     elif col_s == 'volume': rename_map[col] = 'Volume'
                 raw_df = raw_df.rename(columns=rename_map)
     
-                # Select only the columns we absolutely need
+            # This check is now more critical. If `usecols` was used, raw_df will only have those columns.
+            # If it was a headed CSV, this check is still important after renaming.
             if not all(col in raw_df.columns for col in expected_column_names):
-                 # If expected names are not present after auto-detection/renaming, try to map by position if no header was detected
+                # This block might need adjustment if usecols makes it impossible to reach here for headerless.
+                # For headerless CSVs with `usecols=expected_column_names`, raw_df.columns should exactly be expected_column_names.
+                # So, this `if` condition would primarily be for headed CSVs that after renaming are missing columns.
                 if looks_like_data and len(raw_df.columns) >= len(expected_column_names):
-                    # This assumes the first 7 columns are Ticker, Date, Open, High, Low, Close, Volume in order
+                    # This part might be less relevant now for headerless if usecols is effective.
+                    # If usecols correctly restricts columns, raw_df.columns will be expected_column_names.
                     col_map_by_pos = {raw_df.columns[i]: expected_column_names[i] for i in range(len(expected_column_names))}
-                    raw_df = raw_df.rename(columns=col_map_by_pos)
-                else:
-                    raise ValueError(f"CSV must contain or be mappable to columns: {expected_column_names}. Found: {raw_df.columns.tolist()}")
+                    raw_df = raw_df.rename(columns=col_map_by_pos) # This rename might be redundant if usecols + names worked as expected
+                # For headed CSVs, if renaming didn't yield all expected columns:
+                elif not looks_like_data:
+                     raise ValueError(f"CSV (with header) must contain or be mappable to columns: {expected_column_names}. Found after renaming: {raw_df.columns.tolist()}")
+                # For headerless, if usecols somehow didn't result in the expected columns (should not happen if CSV has enough columns)
+                elif looks_like_data:
+                     raise ValueError(f"Headerless CSV, despite using usecols={expected_column_names}, did not result in the expected columns. Columns found: {raw_df.columns.tolist()}")
+
             
-            # De-duplicate columns in raw_df, keeping the first occurrence.
-            # This is crucial if the renaming process (e.g. mapping both 'close'
-            # and 'closeadj' to 'Close') created duplicate column names that
-            # are part of expected_column_names. This ensures self.stock_data_df
-            # will have the correct number of columns.
             raw_df = raw_df.loc[:, ~raw_df.columns.duplicated(keep='first')]
+            # Now, self.stock_data_df will be created from raw_df.
+            # If `usecols` was used for headerless, raw_df already contains only the expected columns.
+            # If it was a headed CSV, raw_df might have more columns, and we select expected_column_names.
             self.stock_data_df = raw_df[expected_column_names].copy()
 
-            # Convert 'Date' column, trying specific format first, then general parsing
+
             try:
                 self.stock_data_df['Date'] = pd.to_datetime(self.stock_data_df['Date'], format='%m-%d-%y')
             except ValueError:
@@ -96,77 +158,33 @@ class MyDataset(Dataset):
                 except Exception as e_date:
                     raise ValueError(f"Could not parse Date column. Ensure format is MM-DD-YY or YYYY-MM-DD. Error: {e_date}")
 
-            # Convert OHLCV columns to numeric, coercing errors
-            # Numeric conversion for 'Open', 'High', 'Low', 'Close', 'Volume' columns
-            # is handled by the more robust loop below (starting around original line 127).
-            # This earlier loop is removed to prevent TypeError if duplicate column names exist.
-            
-            # Drop rows where essential numeric data is missing after coercion (this was an earlier drop, let's refine)
-            # First, ensure Ticker and Date are not NaN before attempting to_numeric on OHLCV
             self.stock_data_df = self.stock_data_df.dropna(subset=['Ticker', 'Date'])
-            self.stock_data_df = self.stock_data_df[self.stock_data_df['Ticker'].isin(comlist)] # Filter by comlist early
+            self.stock_data_df = self.stock_data_df[self.stock_data_df['Ticker'].isin(self.comlist)] 
 
-            print(f"DEBUG MyDataset: Columns in self.stock_data_df after initial load & selection, before to_numeric: {self.stock_data_df.columns.tolist()}")
-            print(f"DEBUG MyDataset: DataFrame shape before to_numeric: {self.stock_data_df.shape}")
-            if not self.stock_data_df.empty:
-                print(f"DEBUG MyDataset: DataFrame dtypes before to_numeric: \n{self.stock_data_df.dtypes}")
-                # Check for duplicate columns, which can cause issues when selecting a single column
-                if self.stock_data_df.columns.has_duplicates:
-                    print(f"WARNING MyDataset: DataFrame has duplicate columns: {self.stock_data_df.columns[self.stock_data_df.columns.duplicated()].tolist()}")
-            else:
-                # This means after filtering by comlist, or initial dropna, the df is empty.
-                # The error for this case will be raised later if it remains empty before numeric conversion.
-                print(f"DEBUG MyDataset: DataFrame is empty after comlist filtering and Ticker/Date dropna, before numeric conversion loop.")
-
-
-            # Ensure all expected columns for numeric conversion are present
             numeric_cols_to_convert = ['Open', 'High', 'Low', 'Close', 'Volume']
-            
-            if self.stock_data_df.empty: # Check if empty after filtering by comlist and Ticker/Date dropna
-                raise ValueError(f"No valid data remaining for comlist: {comlist} from {self.root_csv_path} (DataFrame became empty before numeric conversion loop).")
+            if self.stock_data_df.empty: 
+                raise ValueError(f"No valid data remaining for comlist: {self.comlist} from {self.root_csv_path} (DataFrame became empty before numeric conversion loop).")
 
             for _col_check in numeric_cols_to_convert:
                 if _col_check not in self.stock_data_df.columns:
-                    # This error should ideally be caught earlier if column mapping failed
                     raise ValueError(f"CRITICAL PRE-CHECK MyDataset: Column '{_col_check}' not found in DataFrame before numeric conversion. Columns are: {self.stock_data_df.columns.tolist()}")
 
-            # Convert OHLCV columns to numeric, coercing errors
             for col_to_convert in numeric_cols_to_convert:
-                print(f"DEBUG MyDataset: Attempting pd.to_numeric for column: '{col_to_convert}'")
                 if col_to_convert in self.stock_data_df:
-                    # Crucially, check if selecting the column results in a Series or DataFrame (due to duplicate column names)
                     try:
                         column_data_slice = self.stock_data_df[col_to_convert]
-                        print(f"DEBUG MyDataset: Type of self.stock_data_df['{col_to_convert}']: {type(column_data_slice)}")
-
                         if isinstance(column_data_slice, pd.Series):
-                            print(f"DEBUG MyDataset: Head of Series self.stock_data_df['{col_to_convert}']: \n{column_data_slice.head()}")
                             self.stock_data_df[col_to_convert] = pd.to_numeric(column_data_slice, errors='coerce')
                         elif isinstance(column_data_slice, pd.DataFrame):
-                            print(f"ERROR MyDataset: self.stock_data_df['{col_to_convert}'] is a DataFrame, likely due to duplicate column names. Columns: {column_data_slice.columns.tolist()}")
-                            print(f"DEBUG MyDataset: Head of DataFrame self.stock_data_df['{col_to_convert}']: \n{column_data_slice.head()}")
-                            # Attempt to convert the first column if it's a DataFrame due to duplicates
                             if not column_data_slice.empty:
-                                print(f"DEBUG MyDataset: Attempting to_numeric on the first column of the DataFrame: {column_data_slice.iloc[:, 0].name}")
                                 self.stock_data_df[col_to_convert] = pd.to_numeric(column_data_slice.iloc[:, 0], errors='coerce')
-                            else:
-                                print(f"WARNING MyDataset: DataFrame slice for '{col_to_convert}' is empty.")
-                        else:
-                            print(f"ERROR MyDataset: self.stock_data_df['{col_to_convert}'] is neither Series nor DataFrame. Type: {type(column_data_slice)}. Cannot convert to numeric.")
-                            # Optionally raise an error here or leave as is, to be caught by dropna or later issues
                     except Exception as e_slice_convert:
                         print(f"ERROR MyDataset: Exception during slice or pd.to_numeric for column '{col_to_convert}': {e_slice_convert}")
-                        # This might leave the column as is, or partially converted if error was in assignment
-                else:
-                    # This case should have been caught by the pre-check loop above.
-                    print(f"WARNING MyDataset: Column '{col_to_convert}' was expected but not found in loop for pd.to_numeric. This is unexpected.")
             
-            # Drop rows where any of the essential numeric columns became NaN after conversion
-            print(f"DEBUG MyDataset: Columns before final dropna: {self.stock_data_df.columns.tolist()}")
             self.stock_data_df = self.stock_data_df.dropna(subset=numeric_cols_to_convert)
 
             if self.stock_data_df.empty:
-                raise ValueError(f"No valid data remaining after numeric conversion and NaN drop for comlist: {comlist} from {self.root_csv_path}")
+                raise ValueError(f"No valid data remaining after numeric conversion and NaN drop for comlist: {self.comlist} from {self.root_csv_path}")
 
             self.stock_data_df = self.stock_data_df.set_index(['Ticker', 'Date'])
             self.stock_data_df = self.stock_data_df.sort_index()
@@ -180,89 +198,59 @@ class MyDataset(Dataset):
 
         self.dates, self.next_day = self.find_dates(self.start_str, self.end_str, self.comlist)
         
-        # Determine graph directory path
         graph_dir_name = f'{self.market}_{self.dataset_type}_{self.start_str}_{self.end_str}_{self.window}'
-        # Ensure the graph directory path is absolute to avoid issues with changing CWD
         self.graph_directory_path = os.path.abspath(os.path.join(self.desti, graph_dir_name))
 
-        # Calculate the theoretical maximum number of graphs based on dates
         theoretical_max_graphs = 0
-        if self.dates: # Check if self.dates is not empty
-            temp_actual_dates_for_calc = list(self.dates) # Make a copy
-            # Condition to append next_day for calculation:
-            # 1. self.next_day exists
-            # 2. self.next_day is not already in the current list of dates
-            # 3. The current list of dates has enough entries for at least one window
+        if self.dates: 
+            temp_actual_dates_for_calc = list(self.dates) 
             if self.next_day and \
                self.next_day not in temp_actual_dates_for_calc and \
                len(temp_actual_dates_for_calc) >= self.window:
                 temp_actual_dates_for_calc.append(self.next_day)
             
-            # A graph sample requires 'window' days for features and 1 day for the label.
-            # So, we need at least 'window + 1' days in temp_actual_dates_for_calc.
             if len(temp_actual_dates_for_calc) >= self.window + 1:
-                # The number of possible start points for a (window + 1) slice is:
-                # len(temp_actual_dates_for_calc) - (self.window + 1) + 1
-                # = len(temp_actual_dates_for_calc) - self.window
                 theoretical_max_graphs = len(temp_actual_dates_for_calc) - self.window
         
-        # Check if all theoretically possible graph files exist
-        all_theoretical_files_exist = False # Default to false
+        all_theoretical_files_exist = False 
         if theoretical_max_graphs == 0:
-            # If no graphs are theoretically possible, then "all" (zero) of them exist by definition,
-            # or rather, no generation is needed.
             all_theoretical_files_exist = True
         elif os.path.exists(self.graph_directory_path):
-            all_theoretical_files_exist = True # Assume true initially, verify below
+            all_theoretical_files_exist = True 
             for i in range(theoretical_max_graphs):
                 if not os.path.exists(os.path.join(self.graph_directory_path, f'graph_{i}.pt')):
                     all_theoretical_files_exist = False
                     break
-        # If theoretical_max_graphs > 0 but directory doesn't exist, all_theoretical_files_exist remains False.
-
-        # Decide whether to generate graphs
+        
         needs_generation = False
         if theoretical_max_graphs > 0 and not all_theoretical_files_exist:
             needs_generation = True
             print(f"Graph files at {self.graph_directory_path} seem incomplete or missing for {theoretical_max_graphs} theoretical graphs. Regenerating...")
-        elif theoretical_max_graphs > 0 and not os.path.exists(self.graph_directory_path): # Explicitly check if dir missing
+        elif theoretical_max_graphs > 0 and not os.path.exists(self.graph_directory_path): 
             needs_generation = True
             print(f"Graph directory {self.graph_directory_path} missing. Generating {theoretical_max_graphs} theoretical graphs...")
         
         if needs_generation:
             self._create_graphs(self.dates, self.desti, self.comlist, self.market, self.window, self.next_day)
-        elif theoretical_max_graphs > 0 : # Files exist or dir exists and files are complete
+        elif theoretical_max_graphs > 0 : 
              print(f"Graph files at {self.graph_directory_path} appear to be complete for {theoretical_max_graphs} theoretical graphs. Skipping generation.")
-        else: # theoretical_max_graphs is 0
+        else: 
             print(f"No graphs are theoretically possible (theoretical_max_graphs=0) for {self.graph_directory_path}. Skipping generation.")
 
-
-        # After generation (or skipping it), determine the actual number of available graph files
-        # This will be the true length of the dataset by finding contiguous files from index 0.
         self._actual_len = 0
         if os.path.exists(self.graph_directory_path):
-            # Probe for graph_0.pt, graph_1.pt, ... up to theoretical_max_graphs
-            # theoretical_max_graphs serves as an upper bound for probing to avoid infinite loops or excessive checks
-            # if many more non-contiguous files exist.
-            # If theoretical_max_graphs is 0, this loop won't run, _actual_len remains 0.
             for i in range(theoretical_max_graphs):
                 if os.path.exists(os.path.join(self.graph_directory_path, f'graph_{i}.pt')):
                     self._actual_len += 1
                 else:
-                    # Stop at the first missing file in the sequence from 0.
                     break
         
         print(f"MyDataset initialized for {self.graph_directory_path}. Actual length determined: {self._actual_len}.")
         if self._actual_len == 0 and theoretical_max_graphs > 0:
-            print(f"Warning: Actual length is 0, but {theoretical_max_graphs} graphs were theoretically possible. "
-                  f"This might indicate issues in graph generation (e.g., all windows failed data checks) "
-                  f"or data availability for {self.graph_directory_path}.")
+            print(f"Warning: Actual length is 0, but {theoretical_max_graphs} graphs were theoretically possible. ")
         elif self._actual_len < theoretical_max_graphs:
-             print(f"Warning: Actual length {self._actual_len} is less than theoretical max {theoretical_max_graphs} for {self.graph_directory_path}. "
-                   f"Some graph windows might have been skipped during generation due to data issues.")
+             print(f"Warning: Actual length {self._actual_len} is less than theoretical max {theoretical_max_graphs} for {self.graph_directory_path}. ")
 
-        # Graph data will be loaded lazily in __getitem__.
-        # self._actual_len (calculated above) represents the number of graph files expected to be available.
         if self._actual_len > 0:
             print(f"{self._actual_len} graph files are expected to be available for lazy loading.")
         elif theoretical_max_graphs > 0:
@@ -270,7 +258,7 @@ class MyDataset(Dataset):
 
 
     def __len__(self):
-        return self._actual_len # This reflects the number of graph files found during initialization.
+        return self._actual_len 
 
     def __getitem__(self, idx: int):
         if idx < 0 or idx >= self._actual_len:
@@ -279,18 +267,13 @@ class MyDataset(Dataset):
         data_path = os.path.join(self.graph_directory_path, f'graph_{idx}.pt')
         
         try:
-            # Load the graph tensor on demand
             graph_data = torch.load(data_path)
             return graph_data
         except FileNotFoundError:
-            # This should ideally not happen if _actual_len was determined correctly
-            # and no files were deleted post-initialization.
-            print(f"ERROR MyDataset.__getitem__({idx}): File not found at {data_path}. This might indicate an issue with graph file availability or _actual_len calculation.")
-            raise # Re-raise FileNotFoundError or a custom error
+            print(f"ERROR MyDataset.__getitem__({idx}): File not found at {data_path}.")
+            raise 
         except Exception as e:
             print(f"ERROR MyDataset.__getitem__({idx}): Failed to load graph from {data_path}: {e}")
-            # Depending on desired robustness, could return None, skip, or raise.
-            # Raising an error is generally safer to signal a problem.
             raise
 
 
@@ -301,310 +284,226 @@ class MyDataset(Dataset):
         end = datetime.strptime(end_str, date_format)
         return start <= date <= end
 
-    def find_dates(self, start_str_param: str, end_str_param: str, comlist: List[str]) -> Tuple[List[str], str]:
+    def find_dates(self, start_str_param: str, end_str_param: str, comlist_arg: List[str]) -> Tuple[List[str], str]: # Renamed comlist to comlist_arg
         """
-        Finds common trading dates for the given companies within the MultiIndex DataFrame.
+        Finds common trading dates for the given companies (comlist_arg) within self.stock_data_df.
         Uses parameters for start/end dates directly.
+        Leverages pandas vectorized operations for improved performance.
         """
         start_dt = pd.to_datetime(start_str_param)
         end_dt = pd.to_datetime(end_str_param)
-        # Define a reasonable future limit for finding next_day
-        future_limit_dt = end_dt + pd.Timedelta(days=90) # Look 90 days beyond end_str for next_day
+        future_limit_dt = end_dt + pd.Timedelta(days=90) 
 
-        date_sets = []
-        after_end_date_sets = []
-
-        # Ensure all requested companies are in the DataFrame
-        available_tickers = self.stock_data_df.index.get_level_values('Ticker').unique()
-        valid_comlist = [ticker for ticker in comlist if ticker in available_tickers]
+        available_tickers_in_df = self.stock_data_df.index.get_level_values('Ticker').unique()
+        valid_comlist_arg = [ticker for ticker in comlist_arg if ticker in available_tickers_in_df]
         
-        if len(valid_comlist) < len(comlist):
-            missing_tickers = set(comlist) - set(valid_comlist)
-            print(f"Warning: Tickers not found in DataFrame: {missing_tickers}. Proceeding with available tickers: {valid_comlist}")
+        if len(valid_comlist_arg) < len(comlist_arg):
+            missing_tickers = set(comlist_arg) - set(valid_comlist_arg)
+            if missing_tickers: 
+                 print(f"Warning: Requested tickers not found in the pre-loaded DataFrame's data: {missing_tickers}. Proceeding with available tickers: {valid_comlist_arg}")
         
-        if not valid_comlist:
-            print(f"Warning: None of the requested tickers {comlist} found in the DataFrame. Cannot find common dates.")
+        if not valid_comlist_arg:
+            print(f"Warning: None of the requested tickers {comlist_arg} (or valid subset) found in the DataFrame. Cannot find common dates.")
             return [], None
         
-        comlist_to_use = valid_comlist
-
-        for ticker in comlist_to_use:
-            try:
-                # Dates for the current ticker from the DataFrame's index
-                # Ensure the index level name 'Date' matches your DataFrame
-                ticker_all_dates_pd = self.stock_data_df.loc[ticker].index.get_level_values('Date')
-                
-                # Filter dates within the [start_dt, end_dt] range
-                dates_in_range = {
-                    date.strftime("%Y-%m-%d") for date in ticker_all_dates_pd
-                    if start_dt <= date <= end_dt
-                }
-                if dates_in_range:
-                    date_sets.append(dates_in_range)
-
-                # Filter dates after end_dt up to future_limit_dt for next_day calculation
-                dates_after_end = {
-                    date.strftime("%Y-%m-%d") for date in ticker_all_dates_pd
-                    if end_dt < date <= future_limit_dt
-                }
-                if dates_after_end:
-                    after_end_date_sets.append(dates_after_end)
-
-            except KeyError:
-                # This can happen if a ticker from comlist is not in self.stock_data_df after all
-                print(f"Warning: Ticker {ticker} not found in DataFrame during date finding. Skipping.")
-                continue
-            except Exception as e:
-                print(f"Error processing dates for ticker {ticker}: {e}")
-                # Potentially remove this ticker from comlist_to_use or handle more gracefully
-                return [], None # Critical error, cannot proceed
+        comlist_to_use_for_find_dates = valid_comlist_arg
+        num_expected_tickers = len(comlist_to_use_for_find_dates)
         
-        if not date_sets or len(date_sets) != len(comlist_to_use): # Ensure all valid companies contributed dates
-            print(f"Warning: Could not find historical data for all companies in {comlist_to_use} between {start_str_param} and {end_str_param}.")
-            # If even one company has no data in range, intersection will be empty.
+        idx_df = self.stock_data_df.index.to_frame(index=False)
+        idx_df_filtered_for_current_comlist = idx_df[idx_df['Ticker'].isin(comlist_to_use_for_find_dates)]
+        
+        relevant_ticker_dates_df = idx_df_filtered_for_current_comlist[
+            (idx_df_filtered_for_current_comlist['Date'] >= start_dt) &
+            (idx_df_filtered_for_current_comlist['Date'] <= future_limit_dt)
+        ]
+
+        if relevant_ticker_dates_df.empty:
+            print(f"Warning: No data found for the valid tickers {comlist_to_use_for_find_dates} within the date range {start_str_param} to {future_limit_dt.strftime('%Y-%m-%d')}.")
             return [], None
 
-        # Find common dates by intersection
-        common_dates_str = list(set.intersection(*date_sets))
-        
-        next_common_day_str = None
-        if after_end_date_sets and len(after_end_date_sets) == len(comlist_to_use): # Ensure all contributed for next day
-            common_after_end_dates_str = list(set.intersection(*after_end_date_sets))
-            if common_after_end_dates_str:
-                next_common_day_str = min(common_after_end_dates_str)
-        
-        if not common_dates_str:
-            print(f"Warning: No common trading dates found for companies {comlist_to_use} between {start_str_param} and {end_str_param}.")
-            return [], None
+        date_counts = relevant_ticker_dates_df.groupby('Date')['Ticker'].nunique()
+        common_dates_ts_series = date_counts[date_counts == num_expected_tickers].index
+
+        if common_dates_ts_series.empty:
+            print(f"Warning: No dates found where all {num_expected_tickers} companies in {comlist_to_use_for_find_dates} have data, for the period {start_str_param} to {future_limit_dt.strftime('%Y-%m-%d')}.")
+            return [], None 
             
-        return sorted(common_dates_str), next_common_day_str
+        actual_common_dates_str = []
+        after_end_common_dates_str = []
 
-    def signal_energy(self, x_tuple: Tuple[float, ...]) -> float: # Corrected type hint
-        x = np.array(x_tuple)
-        return np.sum(np.square(x))
+        for date_ts in common_dates_ts_series:
+            date_str = date_ts.strftime("%Y-%m-%d") 
+            if date_ts <= end_dt: 
+                actual_common_dates_str.append(date_str)
+            elif date_ts > end_dt: 
+                after_end_common_dates_str.append(date_str)
+        
+        next_common_day_str = min(after_end_common_dates_str) if after_end_common_dates_str else None
 
-    def information_entropy(self, x_tuple: Tuple[float, ...]) -> float: # Corrected type hint
-        x = np.array(x_tuple)
-        if x.size == 0: return 0.0 # Handle empty array case
-        unique, counts = np.unique(x, return_counts=True)
-        probabilities = counts / np.sum(counts)
-        # Filter out zero probabilities to avoid log(0)
-        probabilities = probabilities[probabilities > 0]
-        if probabilities.size == 0: return 0.0 # Handle case where all probabilities are zero (e.g. single unique value)
-        entropy = -np.sum(probabilities * np.log(probabilities))
-        return entropy
+        if not actual_common_dates_str:
+             print(f"Warning: No common trading dates found for companies {comlist_to_use_for_find_dates} strictly between {start_str_param} and {end_str_param}. (next_common_day_str exists: {next_common_day_str is not None})")
+        
+        return sorted(actual_common_dates_str), next_common_day_str
+
+    def signal_energy(self, X_company_series: torch.Tensor) -> torch.Tensor:
+        return torch.sum(torch.square(X_company_series), dim=1)
+
+    def information_entropy(self, X_company_series: torch.Tensor) -> torch.Tensor:
+        entropy_list = []
+        num_companies = X_company_series.shape[0]
+        device = X_company_series.device
+        for i in range(num_companies):
+            row = X_company_series[i, :]
+            if row.numel() == 0:
+                entropy_list.append(torch.tensor(0.0, device=device, dtype=torch.float32))
+                continue
+            unique_elements, counts = torch.unique(row, return_counts=True)
+            probabilities = counts.float() / torch.sum(counts).float()
+            probabilities = probabilities[probabilities > 0] 
+            if probabilities.numel() == 0: 
+                entropy_list.append(torch.tensor(0.0, device=device, dtype=torch.float32))
+                continue
+            entropy_val = -torch.sum(probabilities * torch.log(probabilities))
+            entropy_list.append(entropy_val)
+        return torch.stack(entropy_list)
 
     def adjacency_matrix(self, X: torch.Tensor) -> torch.Tensor:
-        """
-        Calculates the adjacency matrix based on signal energy and information entropy.
-        Optimized to use vectorized operations.
-        X shape: (num_companies, num_days_in_feature_window_slice)
-        Returns A shape: (num_companies, num_companies)
-        """
         if X.ndim != 2:
             raise ValueError(f"Input X to adjacency_matrix must be 2D (num_companies, num_features_per_company). Got shape {X.shape}")
-
         num_companies = X.shape[0]
         if num_companies == 0:
             return torch.empty((0, 0), dtype=torch.float32)
-
-        # Ensure X is float for calculations if it's not already
-        X_float = X.float() # Use float for calculations like energy/entropy
-
-        # Calculate energy and entropy for each company's feature vector
-        # X_float is (num_companies, num_features_per_company)
-        # energy_sq = torch.square(X_float) # (num_companies, num_features_per_company)
-        # energy = torch.sum(energy_sq, dim=1) # (num_companies)
-        
-        # Using numpy for signal_energy and information_entropy as per original logic,
-        # but applied per row of X (which is X_processed[l_feature_idx] in the caller)
-        # X_np is (num_companies, num_days_in_window_for_this_feature_slice)
-        X_np = X_float.numpy() # Convert once
-        
-        energy_list = [self.signal_energy(tuple(x_row)) for x_row in X_np]
-        entropy_list = [self.information_entropy(tuple(x_row)) for x_row in X_np]
-
-        energy_t = torch.tensor(energy_list, dtype=torch.float32, device=X.device)
-        entropy_t = torch.tensor(entropy_list, dtype=torch.float32, device=X.device)
-
-        # Expand dimensions for broadcasting: (num_companies, 1) and (1, num_companies)
+        X_float = X.float() 
+        energy_t = self.signal_energy(X_float) 
+        entropy_t = self.information_entropy(X_float)
         energy_i = energy_t.unsqueeze(1)
         energy_j = energy_t.unsqueeze(0)
         entropy_i = entropy_t.unsqueeze(1)
         entropy_j = entropy_t.unsqueeze(0)
-
-        # Avoid division by zero for energy_j
-        # Create a mask for energy_j == 0
         zero_energy_j_mask = (energy_j == 0)
-
-        # Calculate A using broadcasting, handle division by zero
-        # Initialize A with zeros
         A = torch.zeros((num_companies, num_companies), dtype=torch.float32, device=X.device)
-
-        # Calculate ratio part, replacing division by zero with a placeholder (e.g., 0 or 1)
-        # to avoid NaN/inf that would propagate. If energy_j is 0, the corresponding A[i,j] will be 0.
-        energy_ratio = torch.where(zero_energy_j_mask, torch.zeros_like(energy_i), energy_i / (energy_j + 1e-9)) # Add epsilon to avoid div by zero if not masked
-
+        energy_ratio = torch.where(zero_energy_j_mask, torch.zeros_like(energy_i), energy_i / (energy_j + 1e-9)) 
         exp_entropy_diff = torch.exp(entropy_i - entropy_j)
-        
-        # Calculate A values where energy_j is not zero
         A_calculated_values = energy_ratio * exp_entropy_diff
-        
-        # Assign calculated values to A, respecting the zero_energy_j_mask
-        # Where energy_j was zero, A remains 0. Otherwise, use calculated value.
         A = torch.where(zero_energy_j_mask.expand_as(A), torch.zeros_like(A), A_calculated_values)
-        
-        # Original logic: A[A < 1] = 1, then log(A)
-        # Apply threshold: if A[i,j] < 1, set to 1.
-        # This must be done carefully if A contains zeros from the division by zero handling.
-        # If A[i,j] is 0 due to energy_j being 0, log(0) is -inf.
-        # If A[i,j] is calculated and < 1 (but > 0), it becomes 1, then log(1)=0.
-        
-        # Mask for values less than 1 but greater than a small epsilon (to avoid affecting true zeros from zero_energy_j)
-        # Values that are exactly 0 (from zero_energy_j) should remain 0 to become -inf after log, or handled.
-        # The original code implies that if energy_j is 0, A[i,j] is 0. Then log(0) is problematic.
-        # Let's assume if A[i,j] is 0 from the start (due to energy_j=0), it should remain so, leading to log(0).
-        # If it's calculated to be >0 and <1, then it becomes 1.
-
-        # Create a mask for A < 1 AND A > 0 (or a very small positive number)
-        # This ensures we don't turn actual zeros (from energy_j=0) into 1s.
-        condition_A_lt_1_and_gt_0 = (A < 1.0) & (A > 1e-9) # Check A > small_epsilon
+        condition_A_lt_1_and_gt_0 = (A < 1.0) & (A > 1e-9) 
         A = torch.where(condition_A_lt_1_and_gt_0, torch.ones_like(A), A)
-        
-        # Logarithm. torch.log(0) is -inf. torch.log(1) is 0.
-        # If any A value is still 0 (e.g. from energy_j=0), log(A) will be -inf.
-        # This matches the behavior if the original loop set A[i,j]=0 and then took log(0).
-        A_log = torch.log(A + 1e-9) # Add small epsilon to avoid log(0) if strict positive needed, or allow -inf.
-                                  # Original code would do log(A) directly. If A can be 0, then log(0) is -inf.
-                                  # Let's stick to torch.log(A) to match original intent if A can be 0.
-        
-        # If A can be zero from the energy_j=0 case, and log(0) = -inf is acceptable:
-        A_final = torch.log(A)
-        # If -inf is not desired, one might replace zeros with a small number before log, or handle -inf values later.
-        # For now, assume -inf is the intended result of log(0) based on direct translation.
-
+        A_final = torch.log(A + 1e-9) 
         return A_final
 
-
-    def node_feature_matrix(self, window_dates_str: List[str], comlist: List[str], market: str) -> torch.Tensor:
-        """
-        Creates the node feature matrix X from self.stock_data_df.
-        X shape: (num_features, num_companies, num_days_in_window)
-        Assumes 5 features: Open, High, Low, Close, Volume.
-        """
+    def node_feature_matrix(self, window_dates_str: List[str], comlist_arg: List[str], market: str) -> torch.Tensor: # Renamed comlist to comlist_arg
         num_features = 5
-        num_companies = len(comlist)
-        num_days_in_window = len(window_dates_str)
-
-        X = torch.zeros((num_features, num_companies, num_days_in_window))
-        
-        # Convert string dates in window_dates_str to pd.Timestamp for DataFrame indexing
-        window_dates_ts = [pd.to_datetime(date_str) for date_str in window_dates_str]
-
         feature_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        num_companies = len(comlist_arg)
+        num_days_in_window = len(window_dates_str)
+        zero_X_tensor = torch.zeros((num_features, num_companies, num_days_in_window), dtype=torch.float32)
 
-        for company_idx, ticker in enumerate(comlist):
-            for day_idx, current_ts_date in enumerate(window_dates_ts):
-                try:
-                    # Access data for the specific ticker and date
-                    # Ensure current_ts_date is just the date part if DataFrame index has time
-                    day_data = self.stock_data_df.loc[(ticker, current_ts_date.normalize())]
-                    
-                    # Extract the 5 features
-                    # Ensure these columns exist and are numeric from __init__
-                    features = day_data[feature_columns].values
-                    X[:, company_idx, day_idx] = torch.tensor(features, dtype=torch.float32)
+        if not comlist_arg or not window_dates_str:
+            return zero_X_tensor
+        try:
+            window_dates_ts = [pd.to_datetime(date_str) for date_str in window_dates_str]
+            multi_idx = pd.MultiIndex.from_product([comlist_arg, window_dates_ts], names=['Ticker', 'Date'])
+            # Ensure self.stock_data_df is used here, it holds all the data for the instance
+            reindexed_df = self.stock_data_df.loc[:, feature_columns].reindex(multi_idx)
+            filled_df = reindexed_df.fillna(0.0)
+            np_values = filled_df.values
+            reshaped_array = np_values.reshape((num_companies, num_days_in_window, num_features))
+            transposed_array = reshaped_array.transpose(2, 0, 1)
+            X = torch.tensor(transposed_array, dtype=torch.float32)
+            return X
+        except KeyError as e:
+            print(f"Error node_feature_matrix: KeyError - {e}. One or more feature columns not found. Returning zero tensor.")
+            return zero_X_tensor
+        except ValueError as e:
+            print(f"Error node_feature_matrix: ValueError - {e}. Could not reshape array. Returning zero tensor.")
+            return zero_X_tensor
+        except Exception as e:
+            print(f"Error node_feature_matrix: An unexpected error occurred - {e}. Returning zero tensor.")
+            return zero_X_tensor
 
-                except KeyError:
-                    # Data for this ticker/date not found, X remains zeros for this entry
-                    # print(f"Warning: Data not found for {ticker} on {current_ts_date.strftime('%Y-%m-%d')}. Using zeros.")
-                    pass # Keep as zeros, already initialized
-                except Exception as e:
-                    print(f"Error extracting features for {ticker} on {current_ts_date.strftime('%Y-%m-%d')}: {e}. Using zeros.")
-                    # X[:, company_idx, day_idx] remains zeros
-                    pass
-        return X
-
-    def _create_graphs(self, dates: List[str], desti: str, comlist: List[str], market: str, window: int, next_day: str):
+    def _create_graphs(self, dates: List[str], desti: str, comlist_for_graphs: List[str], market_name: str, window_size: int, next_day_str: str):
+        # comlist_for_graphs is self.comlist passed from __init__
+        # market_name is self.market, window_size is self.window, next_day_str is self.next_day
         if not dates:
             print("Warning: No dates provided to _create_graphs. Skipping graph generation.")
             return
 
-        # Ensure next_day is appended only if it's valid and not already in dates
-        # This logic might need refinement if `dates` can be empty or too short
-        if next_day and next_day not in dates and len(dates) >= window :
-            # Create a temporary list for graph generation if next_day is used
-            dates_for_graph_gen = dates + [next_day]
-        else:
-            dates_for_graph_gen = dates # Use original dates if next_day is not valid or not needed for windowing
+        dates_for_graph_gen = list(dates) # Make a copy
+        if next_day_str and next_day_str not in dates_for_graph_gen and len(dates_for_graph_gen) >= window_size:
+            dates_for_graph_gen.append(next_day_str)
 
-        if len(dates_for_graph_gen) <= window:
-             print(f"Warning: Not enough dates ({len(dates_for_graph_gen)}) to form a window of size {window}+1. Skipping graph generation.")
-             return
+        if len(dates_for_graph_gen) <= window_size:
+            print(f"Warning: Not enough dates ({len(dates_for_graph_gen)}) to form a window of size {window_size}+1. Skipping graph generation.")
+            return
         
-        # graph_directory_path is an instance variable, created in __init__
         os.makedirs(self.graph_directory_path, exist_ok=True)
-
-        # The loop should go up to len(dates_for_graph_gen) - window,
-        # as each iteration takes 'window + 1' days from dates_for_graph_gen
-        num_possible_graphs = len(dates_for_graph_gen) - window + 1
+        num_possible_graphs = len(dates_for_graph_gen) - window_size
+        
         if num_possible_graphs <= 0:
-            print(f"Not enough data points in dates_for_graph_gen ({len(dates_for_graph_gen)}) to create any graphs with window size {window}.")
+            print(f"Not enough data points in dates_for_graph_gen ({len(dates_for_graph_gen)}) to create any graphs with window size {window_size}.")
             return
 
-        for i_graph_idx in tqdm(range(num_possible_graphs), desc="Generating Graphs"):
-            filename = os.path.join(self.graph_directory_path, f'graph_{i_graph_idx}.pt')
-
-            if os.path.exists(filename):
+        tasks = []
+        for i_graph_idx in range(num_possible_graphs):
+            graph_file_path = os.path.join(self.graph_directory_path, f'graph_{i_graph_idx}.pt')
+            current_window_dates_str_slice = dates_for_graph_gen[i_graph_idx : i_graph_idx + window_size + 1]
+            
+            if os.path.exists(graph_file_path):
+                # print(f"Graph {i_graph_idx} already exists. Skipping generation.") # Optional: too verbose for MP
                 continue
             
-            # Current window of dates: `window` days for features, `+1` day for label
-            current_window_dates_str = dates_for_graph_gen[i_graph_idx : i_graph_idx + window + 1]
-            
-            if len(current_window_dates_str) != window + 1:
-                print(f"Warning: Skipped graph {i_graph_idx}. Not enough dates for full window + label. Got {len(current_window_dates_str)}, needed {window + 1}.")
+            if len(current_window_dates_str_slice) != window_size + 1:
+                print(f"Warning: Skipped graph {i_graph_idx}. Not enough dates for full window + label. Got {len(current_window_dates_str_slice)}, needed {window_size + 1}.")
                 continue
-
-            # X_features will have shape (num_features, num_companies, window + 1)
-            # The market parameter is passed but not used for data fetching here.
-            X_features_full_window = self.node_feature_matrix(current_window_dates_str, comlist, market)
             
-            if X_features_full_window.shape[2] != window + 1:
-                 print(f"Warning: Node feature matrix for graph {i_graph_idx} has incorrect time steps: {X_features_full_window.shape[2]}, expected {window + 1}. Skipping.")
-                 continue
+            # Arguments for the worker function:
+            # (i_graph_idx, graph_file_path, current_window_dates_str_slice, comlist, market, window, my_dataset_instance)
+            # comlist_for_graphs is self.comlist, used by node_feature_matrix inside worker
+            task_args = (
+                i_graph_idx,
+                graph_file_path,
+                current_window_dates_str_slice,
+                comlist_for_graphs, # This is self.comlist
+                market_name,
+                window_size,
+                self # Pass the MyDataset instance itself
+            )
+            tasks.append(task_args)
 
-            C_labels = torch.zeros(X_features_full_window.shape[1]) # Labels based on number of companies
+        if not tasks:
+            print("No new graphs to generate.")
+            return
 
-            # Label generation: uses the last day (index -1) and second to last day (index -2) of the full window
-            # The 'Close' price is assumed to be the 4th feature (index 3)
-            # X_features_full_window[feature_idx, company_idx, time_idx]
-            close_price_feature_idx = 3 # Assuming 'Close' is the 4th feature (0-indexed)
-            for company_idx in range(C_labels.shape[0]):
-                # Ensure we have data for both days for this company
-                # Accessing -1 (last day in window) and -2 (second to last day in window)
-                last_day_close = X_features_full_window[close_price_feature_idx, company_idx, -1]
-                prev_day_close = X_features_full_window[close_price_feature_idx, company_idx, -2]
-                
-                # Check for non-zero to avoid issues with missing data filled as zero
-                if last_day_close != 0 and prev_day_close != 0:
-                    if last_day_close > prev_day_close:
-                        C_labels[company_idx] = 1
-            
-            # X_processed for model input: uses data from the first `window` days
-            # Shape: (num_features, num_companies, window)
-            X_processed = X_features_full_window[:, :, :-1].clone()
+        num_processes = os.cpu_count()
+        print(f"Starting graph generation with {num_processes} processes for {len(tasks)} tasks...")
 
-            # Normalization on raw data (log1p) - applied to the feature part of the window
-            for k_feature_idx in range(X_processed.shape[0]): # Renamed inner loop variable
-                X_processed[k_feature_idx] = torch.Tensor(np.log1p(X_processed[k_feature_idx].numpy()))
+        try:
+            if multiprocessing.get_start_method(allow_none=True) != 'fork':
+                if 'fork' in multiprocessing.get_all_start_methods():
+                    multiprocessing.set_start_method('fork', force=True) 
+                    print("Set multiprocessing start method to 'fork'.")
+        except (RuntimeError, AttributeError) as e_mp_setup: 
+            print(f"Could not set multiprocessing start method to 'fork' (Error: {e_mp_setup}). Using default: {multiprocessing.get_start_method()}.")
 
-            # Obtain adjacency tensor
-            A_adj = torch.zeros((X_processed.shape[0], X_processed.shape[1], X_processed.shape[1])) # (num_features, num_companies, num_companies)
-            for l_feature_idx in range(A_adj.shape[0]): # Renamed loop variable
-                # Adjacency matrix per feature slice across companies
-                A_adj[l_feature_idx] = self.adjacency_matrix(X_processed[l_feature_idx]) 
-            
-            torch.save({'X': X_processed, 'A': A_adj, 'Y': C_labels}, filename)
+
+        with multiprocessing.Pool(processes=num_processes) as pool:
+            results = []
+            for result in tqdm(pool.starmap(_mp_worker_graph_generation_task, tasks), total=len(tasks), desc="Generating Graphs (MP)"):
+                results.append(result)
+        
+        successful_count = 0
+        skipped_count = 0
+        error_count = 0
+        for r_idx, r_status, r_msg in results:
+            if r_status == "success":
+                successful_count += 1
+            elif r_status == "skipped_exists":
+                skipped_count +=1
+            else: 
+                error_count += 1
+                print(f"Error in worker for graph {r_idx}: {r_status} - {r_msg}")
+        
+        print(f"Multiprocessing graph generation complete. Successful: {successful_count}, Skipped (exists): {skipped_count}, Errors: {error_count}")
 
 # Placeholder for MultiIndexDataset if it's defined elsewhere or needed later.
 # class MultiIndexDataset(Dataset):
