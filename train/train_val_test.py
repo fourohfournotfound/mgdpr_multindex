@@ -11,7 +11,6 @@ import csv
 from datetime import datetime, timedelta # Added import
 import torch.nn.functional as F
 import pandas as pd # Added for MultiIndex DataFrame
-from torch.cuda.amp import autocast, GradScaler # Added for mixed-precision training
 # import torch.distributions # Not explicitly used in the notebook's training script part
 from sklearn.metrics import matthews_corrcoef, f1_score
 from torch.utils.data import DataLoader # Added for DataLoader optimization
@@ -457,7 +456,7 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
     optimizer.zero_grad(set_to_none=True) # Use set_to_none=True for potential minor perf gain
     
     # Forward pass
-    with autocast(enabled=use_amp):
+    with torch.amp.autocast('cuda', enabled=use_amp):
         if is_profiling:
             with record_function("model_forward"): # Use the imported record_function
                 out_logits = model(X, A) # Expected shape: (Batch_Size, Num_Nodes, Num_Classes) e.g. (32, 9, 2)
@@ -503,7 +502,7 @@ model.reset_parameters()
 
 # --- AMP Scaler ---
 use_amp_flag = args.use_amp and torch.cuda.is_available() and device.type == 'cuda'
-scaler = GradScaler(enabled=use_amp_flag)
+scaler = torch.amp.GradScaler('cuda', enabled=use_amp_flag)
 print(f"Automatic Mixed Precision (AMP) {'enabled' if use_amp_flag else 'disabled'}.")
 
 print("Starting training...")
@@ -690,7 +689,7 @@ for epoch in range(epochs):
                 A_val = val_sample['A'].to(device)
                 C_val = val_sample['Y'].long().to(device)
                 
-                with autocast(enabled=use_amp_flag):
+                with torch.amp.autocast('cuda', enabled=use_amp_flag):
                     out_val_logits = model(X_val, A_val)
                 val_preds = out_val_logits.argmax(dim=2)
                 
@@ -724,7 +723,7 @@ else:
             A_test = test_sample['A'].to(device)
             C_test = test_sample['Y'].long().to(device)
             
-            with autocast(enabled=use_amp_flag):
+            with torch.amp.autocast('cuda', enabled=use_amp_flag):
                 out_test_logits = model(X_test, A_test)
             test_preds = out_test_logits.argmax(dim=2)
             
