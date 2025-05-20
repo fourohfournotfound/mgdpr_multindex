@@ -261,31 +261,61 @@ class MyDataset(Dataset):
              print(f"Warning: Actual length {self._actual_len} is less than theoretical max {theoretical_max_graphs} for {self.graph_directory_path}. "
                    f"Some graph windows might have been skipped during generation due to data issues.")
 
+        # Pre-load all graph data into memory to optimize __getitem__
+        self.loaded_graphs = []
+        if self._actual_len > 0:
+            print(f"Pre-loading {self._actual_len} graph files into memory...")
+            for i in tqdm(range(self._actual_len), desc="Loading graphs into memory"):
+                data_path = os.path.join(self.graph_directory_path, f'graph_{i}.pt')
+                try:
+                    if os.path.exists(data_path):
+                        self.loaded_graphs.append(torch.load(data_path))
+                    else:
+                        # This should not happen if _actual_len was calculated correctly based on existing files.
+                        print(f"ERROR: During pre-loading, file {data_path} for graph_{i} not found, though it was expected based on _actual_len. Stopping pre-load.")
+                        # Optionally, truncate _actual_len here or raise an error.
+                        # For now, we'll have fewer items in loaded_graphs than _actual_len might suggest.
+                        # This will cause an IndexError later if __getitem__ tries to access beyond the truly loaded items.
+                        # A more robust approach might be to re-set _actual_len to len(self.loaded_graphs) here.
+                        break
+                except Exception as e:
+                    print(f"ERROR: Failed to pre-load graph_{i} from {data_path}: {e}")
+                    # Decide how to handle: skip this graph, stop loading, or raise.
+                    # For now, we'll skip and it might lead to a mismatch if not handled.
+                    # Consider adding a placeholder or re-evaluating _actual_len.
+                    # If a file is corrupted, self.loaded_graphs will be shorter.
+                    break # Stop loading if one file fails
+            
+            # If loading stopped prematurely, _actual_len might be greater than len(self.loaded_graphs)
+            if len(self.loaded_graphs) != self._actual_len:
+                print(f"Warning: Pre-loading completed, but only {len(self.loaded_graphs)} graphs were loaded into memory, while _actual_len was {self._actual_len}. "
+                      f"This might be due to missing files or loading errors. Effective dataset size will be {len(self.loaded_graphs)}.")
+                self._actual_len = len(self.loaded_graphs) # Adjust actual length to what was successfully loaded
+
+            if self._actual_len > 0:
+                 print(f"Successfully pre-loaded {self._actual_len} graph files into memory.")
+            elif theoretical_max_graphs > 0 : # _actual_len became 0 after failed preloading
+                 print(f"Warning: Failed to pre-load any graph files into memory, though {theoretical_max_graphs} were expected.")
+
+
     def __len__(self):
-        return self._actual_len
+        return self._actual_len # This now reflects successfully pre-loaded graphs
 
     def __getitem__(self, idx: int):
-        # graph_directory_path is now an instance variable
-        # Bound check to signal end of dataset properly
-        if idx < 0 or idx >= self._actual_len:
-            raise IndexError(f"Index {idx} out of range for dataset of length {self._actual_len}")
+        if idx < 0 or idx >= self._actual_len: # _actual_len is now based on successfully loaded graphs
+            raise IndexError(f"Index {idx} out of range for dataset of length {self._actual_len} (number of pre-loaded graphs)")
         
-        data_path = os.path.join(self.graph_directory_path, f'graph_{idx}.pt')
+        # Return data from the pre-loaded list
+        # No need to check file existence here as it was done during pre-loading
+        try:
+            return self.loaded_graphs[idx]
+        except IndexError:
+            # This might happen if _actual_len was not correctly updated after a partial pre-load
+            # and idx is within the original _actual_len but outside the bounds of the actually loaded_graphs.
+            # The check `idx >= self._actual_len` at the start should prevent this if _actual_len is accurate.
+            print(f"Internal ERROR MyDataset.__getitem__({idx}): Index is within _actual_len ({self._actual_len}) but out of bounds for self.loaded_graphs (len: {len(self.loaded_graphs)}). This indicates an issue with pre-loading logic or _actual_len synchronization.")
+            raise # Re-raise the original IndexError or a custom one.
 
-        file_exists = os.path.exists(data_path)
-        # print(f"DEBUG MyDataset.__getitem__({idx}): Checking path '{data_path}'. Exists: {file_exists}") # Reduced verbosity
-
-        if file_exists:
-            try:
-                return torch.load(data_path)
-            except Exception as e:
-                print(f"ERROR MyDataset.__getitem__({idx}): Failed to load '{data_path}' even though it exists. Error: {e}")
-                raise FileNotFoundError(f"Error loading graph data for index {idx} at {data_path} (file existed but load failed). Original error: {e}")
-        else:
-            # This case should ideally be prevented by the IndexError above if idx is truly out of bounds.
-            # If it's reached, it means _actual_len might be miscalculated or files are missing within the supposed range.
-            print(f"DEBUG MyDataset.__getitem__({idx}): File not found at '{data_path}', but index was within _actual_len ({self._actual_len}). This indicates missing graph files that were expected to exist.")
-            raise FileNotFoundError(f"No graph data found for index {idx} at {data_path} (expected based on _actual_len). Please ensure you've generated the required data correctly.")
 
     def check_years(self, date_str: str, start_str: str, end_str: str) -> bool:
         date_format = "%Y-%m-%d"
@@ -388,22 +418,96 @@ class MyDataset(Dataset):
         return entropy
 
     def adjacency_matrix(self, X: torch.Tensor) -> torch.Tensor:
-        A = torch.zeros((X.shape[0], X.shape[0]), dtype=torch.float32) # Ensure dtype
-        X_np = X.numpy() # Convert once
-        energy = np.array([self.signal_energy(tuple(x_row)) for x_row in X_np])
-        entropy = np.array([self.information_entropy(tuple(x_row)) for x_row in X_np])
+        """
+        Calculates the adjacency matrix based on signal energy and information entropy.
+        Optimized to use vectorized operations.
+        X shape: (num_companies, num_days_in_feature_window_slice)
+        Returns A shape: (num_companies, num_companies)
+        """
+        if X.ndim != 2:
+            raise ValueError(f"Input X to adjacency_matrix must be 2D (num_companies, num_features_per_company). Got shape {X.shape}")
+
+        num_companies = X.shape[0]
+        if num_companies == 0:
+            return torch.empty((0, 0), dtype=torch.float32)
+
+        # Ensure X is float for calculations if it's not already
+        X_float = X.float() # Use float for calculations like energy/entropy
+
+        # Calculate energy and entropy for each company's feature vector
+        # X_float is (num_companies, num_features_per_company)
+        # energy_sq = torch.square(X_float) # (num_companies, num_features_per_company)
+        # energy = torch.sum(energy_sq, dim=1) # (num_companies)
         
-        for i in range(X_np.shape[0]):
-            for j in range(X_np.shape[0]):
-                if energy[j] == 0: # Avoid division by zero
-                    A[i, j] = 0 # Or some other appropriate value like float('inf') or nan
-                else:
-                    value = (energy[i] / energy[j]) * (math.exp(entropy[i] - entropy[j]))
-                    A[i, j] = torch.tensor(value, dtype=torch.float32)
+        # Using numpy for signal_energy and information_entropy as per original logic,
+        # but applied per row of X (which is X_processed[l_feature_idx] in the caller)
+        # X_np is (num_companies, num_days_in_window_for_this_feature_slice)
+        X_np = X_float.numpy() # Convert once
         
-        # Corrected logic for A[A<1]=1 then log(A)
-        A[A < 1] = 1
-        return torch.log(A)
+        energy_list = [self.signal_energy(tuple(x_row)) for x_row in X_np]
+        entropy_list = [self.information_entropy(tuple(x_row)) for x_row in X_np]
+
+        energy_t = torch.tensor(energy_list, dtype=torch.float32, device=X.device)
+        entropy_t = torch.tensor(entropy_list, dtype=torch.float32, device=X.device)
+
+        # Expand dimensions for broadcasting: (num_companies, 1) and (1, num_companies)
+        energy_i = energy_t.unsqueeze(1)
+        energy_j = energy_t.unsqueeze(0)
+        entropy_i = entropy_t.unsqueeze(1)
+        entropy_j = entropy_t.unsqueeze(0)
+
+        # Avoid division by zero for energy_j
+        # Create a mask for energy_j == 0
+        zero_energy_j_mask = (energy_j == 0)
+
+        # Calculate A using broadcasting, handle division by zero
+        # Initialize A with zeros
+        A = torch.zeros((num_companies, num_companies), dtype=torch.float32, device=X.device)
+
+        # Calculate ratio part, replacing division by zero with a placeholder (e.g., 0 or 1)
+        # to avoid NaN/inf that would propagate. If energy_j is 0, the corresponding A[i,j] will be 0.
+        energy_ratio = torch.where(zero_energy_j_mask, torch.zeros_like(energy_i), energy_i / (energy_j + 1e-9)) # Add epsilon to avoid div by zero if not masked
+
+        exp_entropy_diff = torch.exp(entropy_i - entropy_j)
+        
+        # Calculate A values where energy_j is not zero
+        A_calculated_values = energy_ratio * exp_entropy_diff
+        
+        # Assign calculated values to A, respecting the zero_energy_j_mask
+        # Where energy_j was zero, A remains 0. Otherwise, use calculated value.
+        A = torch.where(zero_energy_j_mask.expand_as(A), torch.zeros_like(A), A_calculated_values)
+        
+        # Original logic: A[A < 1] = 1, then log(A)
+        # Apply threshold: if A[i,j] < 1, set to 1.
+        # This must be done carefully if A contains zeros from the division by zero handling.
+        # If A[i,j] is 0 due to energy_j being 0, log(0) is -inf.
+        # If A[i,j] is calculated and < 1 (but > 0), it becomes 1, then log(1)=0.
+        
+        # Mask for values less than 1 but greater than a small epsilon (to avoid affecting true zeros from zero_energy_j)
+        # Values that are exactly 0 (from zero_energy_j) should remain 0 to become -inf after log, or handled.
+        # The original code implies that if energy_j is 0, A[i,j] is 0. Then log(0) is problematic.
+        # Let's assume if A[i,j] is 0 from the start (due to energy_j=0), it should remain so, leading to log(0).
+        # If it's calculated to be >0 and <1, then it becomes 1.
+
+        # Create a mask for A < 1 AND A > 0 (or a very small positive number)
+        # This ensures we don't turn actual zeros (from energy_j=0) into 1s.
+        condition_A_lt_1_and_gt_0 = (A < 1.0) & (A > 1e-9) # Check A > small_epsilon
+        A = torch.where(condition_A_lt_1_and_gt_0, torch.ones_like(A), A)
+        
+        # Logarithm. torch.log(0) is -inf. torch.log(1) is 0.
+        # If any A value is still 0 (e.g. from energy_j=0), log(A) will be -inf.
+        # This matches the behavior if the original loop set A[i,j]=0 and then took log(0).
+        A_log = torch.log(A + 1e-9) # Add small epsilon to avoid log(0) if strict positive needed, or allow -inf.
+                                  # Original code would do log(A) directly. If A can be 0, then log(0) is -inf.
+                                  # Let's stick to torch.log(A) to match original intent if A can be 0.
+        
+        # If A can be zero from the energy_j=0 case, and log(0) = -inf is acceptable:
+        A_final = torch.log(A)
+        # If -inf is not desired, one might replace zeros with a small number before log, or handle -inf values later.
+        # For now, assume -inf is the intended result of log(0) based on direct translation.
+
+        return A_final
+
 
     def node_feature_matrix(self, window_dates_str: List[str], comlist: List[str], market: str) -> torch.Tensor:
         """

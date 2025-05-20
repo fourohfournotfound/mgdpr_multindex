@@ -4,12 +4,14 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import torch
+import torch.profiler # For PyTorch Profiler
 import csv
 from datetime import datetime, timedelta # Added import
 import torch.nn.functional as F
 import pandas as pd # Added for MultiIndex DataFrame
 # import torch.distributions # Not explicitly used in the notebook's training script part
 from sklearn.metrics import matthews_corrcoef, f1_score
+from torch.utils.data import DataLoader # Added for DataLoader optimization
 
 from dataset.graph_dataset_gen import MyDataset # Corrected import
 from model.Multi_GDNN import MGDPR
@@ -54,6 +56,15 @@ root_data_dir = "/workspaces/ai_testground/shortlist_stocks-1.csv" # Path to the
 # MyDataset will create subfolders like: os.path.join(graph_dest_dir, f'{market}_{type}_{start}_{end}_{window}')
 # TODO: Update this path to where you want processed graph data saved
 graph_dest_dir = "./graph_data_processed" # Example: "data/processed_graph_data"
+
+# --- DataLoader Configuration ---
+BATCH_SIZE = 32  # Batch size for DataLoader, adjust as needed
+# Number of worker processes for data loading.
+# Start with 4; good values often range from os.cpu_count() // 2 to os.cpu_count().
+# Too many workers can sometimes increase overhead.
+NUM_WORKERS = 4
+# Pin memory for faster CPU to GPU data transfer if CUDA is available.
+PIN_MEMORY = True # As per optimization requirement
 
 # --- Load Company Lists ---
 # This section is based on the notebook's logic for loading company lists.
@@ -199,6 +210,29 @@ print("Initializing test dataset...")
 test_dataset = MyDataset(root_data_dir, graph_dest_dir, current_market, target_com_list,
                          test_sedate[0], test_sedate[1], window_size, dataset_types[2])
 
+# --- DataLoader Instantiation ---
+# Wrap datasets with DataLoader for batching, shuffling, and parallel loading.
+print(f"Creating DataLoaders with BATCH_SIZE={BATCH_SIZE}, NUM_WORKERS={NUM_WORKERS}, PIN_MEMORY={PIN_MEMORY}")
+train_loader = DataLoader(train_dataset,
+                          batch_size=BATCH_SIZE,
+                          shuffle=True,  # Shuffle training data
+                          num_workers=NUM_WORKERS,
+                          pin_memory=PIN_MEMORY,
+                          drop_last=True) # drop_last can be useful if batch processing logic expects full batches
+
+val_loader = DataLoader(validation_dataset,
+                        batch_size=BATCH_SIZE,
+                        shuffle=False, # No need to shuffle validation data
+                        num_workers=NUM_WORKERS,
+                        pin_memory=PIN_MEMORY)
+
+test_loader = DataLoader(test_dataset,
+                         batch_size=BATCH_SIZE,
+                         shuffle=False, # No need to shuffle test data
+                         num_workers=NUM_WORKERS,
+                         pin_memory=PIN_MEMORY)
+
+
 # --- Model Definition ---
 num_companies = len(target_com_list)
 if num_companies == 0:
@@ -215,7 +249,10 @@ d_layers, num_relation, m_gamma, diffusion_steps = 6, 5, 2.5e-4, 7
 # The MGDPR model's `time_dim` parameter (for D_gamma, ParallelRetention) should be model_feature_len.
 
 # diffusion_config: input to first MultiReDiffusion is model_feature_len
-diffusion_config = [model_feature_len, 3 * model_feature_len, 4 * model_feature_len, 5 * model_feature_len, 5 * model_feature_len, 6 * model_feature_len, 5 * model_feature_len]
+# Original diffusion_config seemed to list desired output dimensions of fc_layers within MultiReDiffusion,
+# plus an initial dimension.
+# dc_original = [model_feature_len, 3 * model_feature_len, 4 * model_feature_len, 5 * model_feature_len, 5 * model_feature_len, 6 * model_feature_len, 5 * model_feature_len]
+# The MGDPR model expects diffusion_config to be [in_fc_MD0, out_fc_MD0, in_fc_MD1, out_fc_MD1, ...]
 
 # retention_config defines in_dim, inter_dim, out_dim for ParallelRetention layers.
 # The `in_dim` for ParallelRetention is derived from the output of MultiReDiffusion and how it's reshaped.
@@ -328,7 +365,40 @@ mlp_config = [final_mlp_input_dim, 128, 2] # 2 for binary classification
 
 # MGDPR's `time_dim` parameter is used for D_gamma and ParallelRetention's self.time_dim.
 # This should be `model_feature_len` (i.e., `window_size`).
-model = MGDPR(diffusion_config, retention_config, ret_linear_1_config, ret_linear_2_config, mlp_config,
+
+# Construct the actual diffusion_config needed by MGDPR model structure
+# The MGDPR model's MultiReDiffusion layers expect config[2*l] as in_features and config[2*l+1] as out_features for their internal fc_layers.
+
+# Desired output dimensions for the fc_layers within each MultiReDiffusion block `l`.
+# Taken from the original interpretation of diffusion_config: dc_original[l+1]
+dc_original_outputs = [
+    3 * model_feature_len,  # For MD block 0
+    4 * model_feature_len,  # For MD block 1
+    5 * model_feature_len,  # For MD block 2
+    5 * model_feature_len,  # For MD block 3
+    6 * model_feature_len,  # For MD block 4
+    5 * model_feature_len   # For MD block 5
+]
+if len(dc_original_outputs) < d_layers:
+    raise ValueError(f"dc_original_outputs length {len(dc_original_outputs)} is less than d_layers {d_layers}")
+
+actual_diffusion_config = []
+# current_input_features_for_md_fc was the input to MultiReDiffusion's fc_layers.
+# For the first MD block (l_idx=0), its fc_layers process h[rel] which has model_feature_len features.
+current_fc_input_dim = model_feature_len
+
+for l_idx in range(d_layers):
+    fc_output_dim = dc_original_outputs[l_idx] # Desired output dimension for fc_layers in MD block l_idx
+    
+    actual_diffusion_config.append(current_fc_input_dim) # In-features for fc_layers in MD block l_idx
+    actual_diffusion_config.append(fc_output_dim)      # Out-features for fc_layers in MD block l_idx
+    
+    # The output of the fc_layers in MD block l_idx becomes the feature dimension
+    # for the input h[rel] to the fc_layers in the next MD block (l_idx+1).
+    current_fc_input_dim = fc_output_dim
+
+
+model = MGDPR(actual_diffusion_config, retention_config, ret_linear_1_config, ret_linear_2_config, mlp_config,
               d_layers, num_companies, model_feature_len, num_relation, m_gamma, diffusion_steps)
 model = model.to(device)
 
@@ -342,69 +412,188 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 criterion = F.cross_entropy # Using criterion directly
 
 # --- Training, Validation, and Testing ---
+# --- Profiler Configuration ---
+# Controls whether profiling is enabled for a few batches in a target epoch.
+# Set to False to disable profiling completely.
+PROFILE_ENABLED = True
+PROFILE_EPOCH_TARGET = 0  # Profile batches in the first epoch (epoch index 0).
+PROFILE_BATCHES_TO_RUN = 5  # Number of batches to profile within the target epoch.
+PROFILER_LOG_DIR = "./mgdpr_profiler_logs"  # Directory for TensorBoard and Chrome traces.
+
+# Create profiler log directory if it doesn't exist
+if PROFILE_ENABLED and not os.path.exists(PROFILER_LOG_DIR):
+    os.makedirs(PROFILER_LOG_DIR, exist_ok=True)
+    print(f"Profiler log directory created: {PROFILER_LOG_DIR}")
+
+# Helper function for a single training step to avoid code duplication
+def train_batch(batch_sample, model, criterion, optimizer, device, is_profiling=False, profiler_context=None):
+    """
+    Processes a single batch of training data.
+    If profiling, profiler_context.step() is called.
+    """
+    X = batch_sample['X'].to(device)
+    A = batch_sample['A'].to(device)
+    C_labels = batch_sample['Y'].long().to(device) # Renamed to avoid conflict with criterion
+
+    optimizer.zero_grad(set_to_none=True) # Use set_to_none=True for potential minor perf gain
+    
+    # Forward pass
+    out_logits = model(X, A) # Expected shape: (Batch_Size, Num_Nodes, Num_Classes) e.g. (32, 9, 2)
+    
+    # Calculate loss
+    # criterion (F.cross_entropy) expects input (logits) as (N, C, ...) and target (labels) as (N, ...)
+    # Current out_logits: (Batch_Size, Num_Nodes, Num_Classes) -> (32, 9, 2)
+    # Current C_labels:   (Batch_Size, Num_Nodes)           -> (32, 9)
+    # We need to permute out_logits to (Batch_Size, Num_Classes, Num_Nodes) for cross_entropy.
+    # So, (32, 2, 9)
+    out_logits_permuted = out_logits.permute(0, 2, 1) # (Batch_Size, Num_Classes, Num_Nodes)
+    
+    loss = criterion(out_logits_permuted, C_labels)
+    
+    # Backward pass and optimization
+    loss.backward()
+    optimizer.step()
+    
+    # Signal profiler step if profiling is active for this batch
+    if is_profiling and profiler_context:
+         profiler_context.step()
+
+    return loss, out_logits, C_labels
+
 epochs = 10 # Reduced for quick testing, notebook uses 10000
 model.reset_parameters()
 
 print("Starting training...")
 for epoch in range(epochs):
     model.train()
-    epoch_loss = 0
+    epoch_loss_sum = 0
     epoch_correct = 0
     epoch_total_samples = 0
 
-    # Check if train_dataset is empty
-    if len(train_dataset) == 0:
-        print(f"Epoch {epoch+1}/{epochs}: Training dataset is empty. Skipping training for this epoch.")
-        # Optionally, break or sys.exit if training cannot proceed
-        break 
+    # Check if train_loader is empty.
+    if len(train_loader) == 0: # Changed from train_dataset to train_loader
+        print(f"Epoch {epoch+1}/{epochs}: Training loader is empty (no batches). Skipping training for this epoch.")
+        # Check if the underlying dataset was also empty
+        if len(train_dataset) == 0:
+            print(f"Epoch {epoch+1}/{epochs}: Underlying training dataset is also empty.")
+        break
+    
+    # Determine if profiling should be active for the current epoch
+    is_profiling_active_epoch = PROFILE_ENABLED and epoch == PROFILE_EPOCH_TARGET
+
+    if is_profiling_active_epoch:
+        print(f"--- Profiling enabled for Epoch {epoch+1}, first {PROFILE_BATCHES_TO_RUN} batches ---")
+        activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available() and device.type == 'cuda': # Check if CUDA is actually used
+            activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+        # on_trace_ready handler for TensorBoard.
+        # Called when the profiler context exits (if no schedule) or at schedule cycle end.
+        tensorboard_trace_handler = torch.profiler.tensorboard_trace_handler(PROFILER_LOG_DIR)
         
-    for i, sample in enumerate(train_dataset):
-        X = sample['X'].to(device)
-        A = sample['A'].to(device)
-        C = sample['Y'].long().to(device)
+        # Profiler context manager
+        with torch.profiler.profile(
+            activities=activities,
+            profile_memory=True,      # Capture memory usage
+            record_shapes=True,     # Record tensor shapes
+            with_stack=True,        # Record call stacks
+            on_trace_ready=tensorboard_trace_handler # Enable TensorBoard output
+            # For this initial setup, a schedule is not used. profiler_context.step() marks iterations.
+        ) as prof:
+            # Profile the first PROFILE_BATCHES_TO_RUN batches
+            for i, sample in enumerate(train_loader): # Changed from train_dataset to train_loader
+                if i >= PROFILE_BATCHES_TO_RUN:
+                    break # Stop profiling after N batches
+                
+                # Process batch using helper, passing profiler context
+                loss, out_logits, C_labels = train_batch(sample, model, criterion, optimizer, device,
+                                                         is_profiling=True, profiler_context=prof)
+                
+                epoch_loss_sum += loss.item()
+                # Predictions should be based on the original out_logits shape (Batch, Num_Nodes, Num_Classes)
+                # argmax over the Num_Classes dimension (dim=2)
+                preds = out_logits.argmax(dim=2) # Shape: (Batch_Size, Num_Nodes)
+                epoch_correct += (preds == C_labels).sum().item()
+                epoch_total_samples += C_labels.numel() # Total number of node-level predictions
+                
+                batch_num_display = i + 1
+                total_batches_in_dataset = len(train_loader) # Changed from train_dataset to train_loader
+                print(f"Epoch {epoch+1}/{epochs}, Batch {batch_num_display}/{total_batches_in_dataset} (Profiling): Loss={loss.item():.4f}")
 
-        optimizer.zero_grad()
-        out_logits = model(X, A)
-        loss = criterion(out_logits, C)
-        # loss += theta_regularizer(model.theta) # Optional regularization
+            # Export Chrome trace after the profiled section (when the 'with prof:' block ends)
+            # This is in addition to the TensorBoard trace from on_trace_ready.
+            chrome_trace_filename = f"profile_epoch_{epoch+1}_first_{PROFILE_BATCHES_TO_RUN}_batches.json"
+            chrome_trace_path = os.path.join(PROFILER_LOG_DIR, chrome_trace_filename)
+            try:
+                prof.export_chrome_trace(chrome_trace_path)
+                print(f"Chrome profiler trace saved to {chrome_trace_path}")
+            except Exception as e:
+                print(f"Error exporting Chrome trace: {e}")
+            print(f"TensorBoard traces (if generated by on_trace_ready) are in {PROFILER_LOG_DIR}")
 
-        loss.backward()
-        optimizer.step()
+        # Continue with the rest of the batches for this epoch (if any) without profiling
+        start_batch_idx_after_profiling = PROFILE_BATCHES_TO_RUN
+        if start_batch_idx_after_profiling < len(train_loader): # Changed from train_dataset to train_loader
+            print(f"--- Continuing Epoch {epoch+1} after profiling ({start_batch_idx_after_profiling}/{len(train_loader)}) ---") # Changed
+            for i, sample in enumerate(train_loader): # Changed from train_dataset to train_loader
+                if i < start_batch_idx_after_profiling:
+                    continue # Skip already processed (profiled) batches
 
-        epoch_loss += loss.item()
-        
-        preds = out_logits.argmax(dim=1)
-        epoch_correct += (preds == C).sum().item()
-        epoch_total_samples += C.size(0)
-        
-        if (i + 1) % 10 == 0: # Print progress every 10 batches
-             print(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(train_dataset)}: Loss={loss.item():.4f}")
+                # Process batch using helper, not profiling here
+                loss, out_logits, C_labels = train_batch(sample, model, criterion, optimizer, device,
+                                                         is_profiling=False, profiler_context=None)
+                
+                epoch_loss_sum += loss.item()
+                preds = out_logits.argmax(dim=2) # Shape: (Batch_Size, Num_Nodes)
+                epoch_correct += (preds == C_labels).sum().item()
+                epoch_total_samples += C_labels.numel() # Total number of node-level predictions
+                if (i + 1) % 10 == 0: # Standard logging for non-profiled part
+                     print(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(train_loader)}: Loss={loss.item():.4f}") # Changed
+    
+    else: # Regular training for epochs not targeted for profiling (or if PROFILE_ENABLED is False)
+        for i, sample in enumerate(train_loader): # Changed from train_dataset to train_loader
+            # Process batch using helper, not profiling here
+            loss, out_logits, C_labels = train_batch(sample, model, criterion, optimizer, device,
+                                                     is_profiling=False, profiler_context=None)
+            
+            epoch_loss_sum += loss.item()
+            preds = out_logits.argmax(dim=2) # Shape: (Batch_Size, Num_Nodes)
+            epoch_correct += (preds == C_labels).sum().item()
+            epoch_total_samples += C_labels.numel() # Total number of node-level predictions
+            if (i + 1) % 10 == 0:
+                 print(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(train_loader)}: Loss={loss.item():.4f}") # Changed
 
-
-    avg_epoch_loss = epoch_loss / len(train_dataset) if len(train_dataset) > 0 else 0
-    avg_epoch_acc = epoch_correct / epoch_total_samples if epoch_total_samples > 0 else 0
-    print(f"Epoch {epoch+1}/{epochs} Summary: Avg Loss={avg_epoch_loss:.4f}, Avg Acc={avg_epoch_acc:.4f}")
+    # Epoch summary (common for all cases)
+    if epoch_total_samples > 0: # Check if any samples were processed
+        num_batches_in_loader = len(train_loader) # Total batches in the loader for this epoch
+        avg_epoch_loss = epoch_loss_sum / num_batches_in_loader if num_batches_in_loader > 0 else 0.0 # Changed
+        avg_epoch_acc = epoch_correct / epoch_total_samples
+        print(f"Epoch {epoch+1}/{epochs} Summary: Avg Loss={avg_epoch_loss:.4f}, Avg Acc={avg_epoch_acc:.4f}")
+    elif len(train_loader) > 0: # Loader not empty, but no samples processed (e.g. if BATCH_SIZE > len(dataset))
+        print(f"Epoch {epoch+1}/{epochs} Summary: No samples processed in this epoch (loader size: {len(train_loader)}, dataset size: {len(train_dataset)}).") # Changed
+    # If len(train_loader) == 0, the 'break' earlier handles it.
 
     # Validation step (optional, can be done less frequently)
-    if (epoch + 1) % 5 == 0 and len(validation_dataset) > 0: # Validate every 5 epochs
+    if (epoch + 1) % 5 == 0 and len(val_loader) > 0: # Validate every 5 epochs, changed from validation_dataset
         model.eval()
         val_correct = 0
         val_total_samples = 0
         val_f1_scores = []
         val_mcc_scores = []
         with torch.no_grad():
-            for val_sample in validation_dataset:
+            for val_sample in val_loader: # Changed from validation_dataset to val_loader
                 X_val = val_sample['X'].to(device)
                 A_val = val_sample['A'].to(device)
                 C_val = val_sample['Y'].long().to(device)
                 
-                out_val_logits = model(X_val, A_val)
-                val_preds = out_val_logits.argmax(dim=1)
+                out_val_logits = model(X_val, A_val) # Shape: (Batch, Num_Nodes, Num_Classes)
+                val_preds = out_val_logits.argmax(dim=2) # Shape: (Batch, Num_Nodes)
                 
                 val_correct += (val_preds == C_val).sum().item()
-                val_total_samples += C_val.size(0)
-                val_f1_scores.append(f1_score(C_val.cpu().numpy(), val_preds.cpu().numpy(), zero_division=0))
-                val_mcc_scores.append(matthews_corrcoef(C_val.cpu().numpy(), val_preds.cpu().numpy()))
+                val_total_samples += C_val.numel() # Total node-level samples
+                # For f1_score and mcc_score, flatten the predictions and labels if they are multi-node per batch item
+                val_f1_scores.append(f1_score(C_val.cpu().numpy().flatten(), val_preds.cpu().numpy().flatten(), zero_division=0))
+                val_mcc_scores.append(matthews_corrcoef(C_val.cpu().numpy().flatten(), val_preds.cpu().numpy().flatten()))
         
         avg_val_acc = val_correct / val_total_samples if val_total_samples > 0 else 0
         avg_val_f1 = sum(val_f1_scores) / len(val_f1_scores) if val_f1_scores else 0
@@ -420,22 +609,24 @@ test_total_samples = 0
 test_f1_scores = []
 test_mcc_scores = []
 
-if len(test_dataset) == 0:
-    print("Test dataset is empty. Skipping testing.")
+if len(test_loader) == 0: # Changed from test_dataset to test_loader
+    print("Test loader is empty. Skipping testing.")
+    if len(test_dataset) == 0:
+        print("Underlying test dataset is also empty.")
 else:
     with torch.no_grad():
-        for test_sample in test_dataset:
+        for test_sample in test_loader: # Changed from test_dataset to test_loader
             X_test = test_sample['X'].to(device)
             A_test = test_sample['A'].to(device)
             C_test = test_sample['Y'].long().to(device)
             
-            out_test_logits = model(X_test, A_test)
-            test_preds = out_test_logits.argmax(dim=1)
+            out_test_logits = model(X_test, A_test) # Shape: (Batch, Num_Nodes, Num_Classes)
+            test_preds = out_test_logits.argmax(dim=2) # Shape: (Batch, Num_Nodes)
             
             test_correct += (test_preds == C_test).sum().item()
-            test_total_samples += C_test.size(0)
-            test_f1_scores.append(f1_score(C_test.cpu().numpy(), test_preds.cpu().numpy(), zero_division=0))
-            test_mcc_scores.append(matthews_corrcoef(C_test.cpu().numpy(), test_preds.cpu().numpy()))
+            test_total_samples += C_test.numel() # Total node-level samples
+            test_f1_scores.append(f1_score(C_test.cpu().numpy().flatten(), test_preds.cpu().numpy().flatten(), zero_division=0))
+            test_mcc_scores.append(matthews_corrcoef(C_test.cpu().numpy().flatten(), test_preds.cpu().numpy().flatten()))
 
     avg_test_acc = test_correct / test_total_samples if test_total_samples > 0 else 0
     avg_test_f1 = sum(test_f1_scores) / len(test_f1_scores) if test_f1_scores else 0

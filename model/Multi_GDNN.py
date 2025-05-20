@@ -12,21 +12,57 @@ class MultiReDiffusion(torch.nn.Module):
         self.activation0 = torch.nn.PReLU()
         self.num_relation = num_relation
 
-    def forward(self, theta, t, a, x):
-        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Device should be handled by the parent module
-        device = x.device # More robust: use the device of the input tensor
-        diffusions = torch.zeros(theta.shape[0], a.shape[1], self.output).to(device)
+    def forward(self, theta_param, t_param, a_input_batched, x_input_batched):
+        # theta_param: (Num_Relations, Expansion_Steps) - Parameters, not batched
+        # t_param: (Num_Relations, Expansion_Steps, Num_Nodes, Num_Nodes) - Parameters, not batched
+        # a_input_batched: (Batch_Size, Num_Relations, Num_Nodes, Num_Nodes) - Batched input adjacencies
+        # x_input_batched: (Batch_Size, Num_Relations, Num_Nodes, Features_Input_Dim) - Batched input features
 
-        for rel in range(theta.shape[0]):
-            diffusion_mat = torch.zeros_like(a[rel]).to(device) # Ensure diffusion_mat is on the correct device
-            for step in range(theta.shape[-1]): # Assuming theta is (num_relation, expansion_steps)
-                # Ensure t and a are also on the correct device, typically handled by parent model
-                diffusion_mat += theta[rel][step] * t[rel][step] * a[rel] 
+        device = x_input_batched.device
+        batch_size = x_input_batched.shape[0]
+        num_relations = theta_param.shape[0] # self.num_relation
+        num_nodes = x_input_batched.shape[2]
+        # self.output is the output feature dimension of self.fc_layers
 
-            diffusion_feat = torch.matmul(diffusion_mat, x[rel])
-            diffusions[rel] = self.activation0(self.fc_layers[rel](diffusion_feat))
+        # Initialize diffusions tensor to store results for each batch item, relation, and node
+        # Shape: (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
+        diffusions_batch = torch.zeros(batch_size, num_relations, num_nodes, self.output, device=device)
 
-        # unsqueeze(0) adds a batch dimension for Conv2d, assuming diffusions is (num_relation, num_nodes, output_dim)
+        for b_idx in range(batch_size):
+            # Get data for the current batch item
+            # These are now unbatched for the inner loops:
+            # a_sample: (Num_Relations, Num_Nodes, Num_Nodes)
+            # x_sample: (Num_Relations, Num_Nodes, Features_Input_Dim)
+            a_sample = a_input_batched[b_idx]
+            x_sample = x_input_batched[b_idx]
+
+            for rel_idx in range(num_relations):
+                # current_a_rel_slice: (Num_Nodes, Num_Nodes)
+                current_a_rel_slice = a_sample[rel_idx]
+                # current_x_rel_slice: (Num_Nodes, Features_Input_Dim)
+                current_x_rel_slice = x_sample[rel_idx]
+                
+                diffusion_mat = torch.zeros_like(current_a_rel_slice, device=device)
+                for step_idx in range(theta_param.shape[1]): # expansion_steps
+                    # t_param[rel_idx, step_idx] is (Num_Nodes, Num_Nodes)
+                    diffusion_mat += theta_param[rel_idx, step_idx] * t_param[rel_idx, step_idx] * current_a_rel_slice
+                
+                # diffusion_feat: (Num_Nodes, Features_Input_Dim)
+                diffusion_feat = torch.matmul(diffusion_mat, current_x_rel_slice)
+                
+                # fc_output: (Num_Nodes, Features_Output_FC)
+                fc_output = self.fc_layers[rel_idx](diffusion_feat)
+                
+                # Store in the correct slice of the batched diffusions tensor
+                diffusions_batch[b_idx, rel_idx] = self.activation0(fc_output)
+
+        # diffusions_batch is now (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
+        # This shape is suitable for self.update_layer (Conv2d)
+        # Conv2d expects (Batch, Channels_in, H, W)
+        # Here, Batch_Size, Num_Relations (as Channels_in), Num_Nodes (as H), Features_Output_FC (as W)
+        
+        # The original code used diffusions.unsqueeze(0) because it assumed diffusions was (R,N,F_out)
+        # Now diffusions_batch is already (B,R,N,F_out), so no unsqueeze is needed.
         # Conv2d expects (batch_size, in_channels, height, width)
         # Here, in_channels = num_relation, height = num_nodes, width = output_dim (if output_dim is treated as width)
         # This might need adjustment based on how num_nodes and output_dim are intended as spatial dimensions.
@@ -52,18 +88,23 @@ class MultiReDiffusion(torch.nn.Module):
         # Input to conv2d should be (Batch, Channels_in, H, W)
         # Here, Batch=1 (implicitly), Channels_in = num_relation. H=num_nodes, W=output_dim
         # So, diffusions.unsqueeze(0) is (1, num_relation, num_nodes, self.output) - this seems correct.
-        latent_feat = self.activation1(self.update_layer(diffusions.unsqueeze(0))) # Add batch dim for Conv2d
-        
-        # Output of Conv2d will be (1, num_relation_out, num_nodes, self.output)
-        # Since num_relation_out = num_relation (from Conv2d definition)
-        # latent_feat is (1, num_relation, num_nodes, self.output)
-        # Reshape to (num_relation, num_nodes, self.output) by removing the batch dim
-        latent_feat = latent_feat.squeeze(0) # Remove batch dim
-        # The original code had: latent_feat = latent_feat.reshape(self.num_relation, a.shape[1], -1)
-        # a.shape[1] is num_nodes. So this is (num_relation, num_nodes, self.output)
-        # This matches if the output of Conv2d is correctly squeezed.
+        latent_feat_batch = self.activation1(self.update_layer(diffusions_batch))
+        # latent_feat_batch shape: (Batch_Size, Num_Relations_out, Num_Nodes, Features_Output_FC)
+        # Since self.update_layer is Conv2d(num_relation, num_relation, ...), Num_Relations_out = Num_Relations.
+        # So, latent_feat_batch is (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
 
-        return latent_feat, diffusions
+        # The MGDPR layer expects two outputs from diffusion_layers:
+        # h_diffused (which becomes the new h for next diffusion) and u_intermediate (input to retention)
+        # Both should have the same shape: (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
+        # In the original paper/notebook, h_diffused and u_intermediate are often the same tensor or derived closely.
+        # Here, latent_feat_batch is the result after the Conv2d update, and diffusions_batch is before it.
+        # Let's return latent_feat_batch as the primary "diffused" representation,
+        # and diffusions_batch as the intermediate one if needed (though often they are the same or u is latent_feat).
+        # The MGDPR model uses the second output (u_intermediate) as input to ParallelRetention.
+        # The first output (h_diffused) becomes the new `h` for the next MGDPR layer's diffusion part.
+        # It's common for u_intermediate to be the same as h_diffused.
+        # Let's assume latent_feat_batch is the refined representation to be used for both purposes.
+        return latent_feat_batch, latent_feat_batch # Return (h_diffused, u_intermediate)
 
 
 class ParallelRetention(torch.nn.Module):
@@ -112,128 +153,69 @@ class ParallelRetention(torch.nn.Module):
         self.V_layers = nn.Linear(self.in_dim, self.inter_dim)
         self.ret_feat = torch.nn.Linear(self.inter_dim, self.out_dim)
 
-    def forward(self, x, d_gamma):
-        # x is expected to be (num_relation, num_nodes, features_from_diffusion)
-        # self.time_dim was passed as `time_steps` (window size) during MGDPR init.
-        # self.in_dim was based on retention_layers config.
-        # The original notebook code:
-        # x.shape[1] is num_nodes
-        # x = x.view(self.time_dim, -1)
-        # This means (num_relation, num_nodes, features) is reshaped to (time_steps, calculated_dim)
-        # This requires num_relation * num_nodes * features == time_steps * calculated_dim.
-        # This seems to be a conceptual mismatch if `time_dim` is `time_steps` (window) and `x` is over relations.
+    def forward(self, x_batched, d_gamma_batched):
+        # x_batched: (Batch_Size, Num_Relations, Num_Nodes, Features_from_Diffusion)
+        # d_gamma_batched: (Batch_Size, Time_Dim_Retention, Time_Dim_Retention)
+        #      or d_gamma: (Time_Dim_Retention, Time_Dim_Retention) to be broadcasted/repeated.
+        #      self.time_dim is Time_Dim_Retention (e.g., window_size)
+        #      self.in_dim is the feature dimension for QKV layers after reshaping x_sample.
 
-        # Let's follow the paper: Z is (T x features), D is (T x T). T is sequence length.
-        # If retention is applied across relations, T = num_relation.
-        # Then x should be (num_relation, num_nodes * features_from_diffusion) before QKV.
-        # Or, if retention is applied across nodes for each relation: T = num_nodes.
-        # Then x should be (num_nodes, features_from_diffusion) for each relation.
-        # Or, if retention is applied across time_steps (window) for each (node, relation): This is most common for time series.
-        # But `u` doesn't have the original time_steps dimension explicitly after diffusion.
-        # The `D_gamma` in MGDPR is (time_dim, time_dim) where time_dim is `time_steps` (window size).
-        # This `D_gamma` is passed to `retention_layers[l](u, self.D_gamma)`.
-        # This strongly implies that `x` (which is `u`) should be shaped like (some_batch_dim, time_steps, features)
-        # for the `d_gamma` matrix to be applicable.
-        # `u` is (num_relation, num_nodes, features_from_diffusion).
-        # If `time_steps` is the retention sequence length, then `u` needs to be permuted/reshaped.
-        # The `x.view(self.time_dim, -1)` in the notebook is problematic if `self.time_dim` is `time_steps` (window)
-        # and `x` is `u` (num_relation, num_nodes, features).
-        # The product of dimensions of `u` is `num_relation * num_nodes * features`.
-        # This must be equal to `self.time_dim * new_feature_dim`.
-        # So, `new_feature_dim = (num_relation * num_nodes * features) / self.time_dim`.
-        # This `new_feature_dim` becomes `self.in_dim` for QKV layers.
+        device = x_batched.device
+        batch_size = x_batched.shape[0]
+        num_nodes_original = x_batched.shape[2] # Num_Nodes
 
-        # Let's assume the notebook's view is intentional and `self.time_dim` is indeed `time_steps`.
-        # And `x` (input `u`) is (num_relation, num_nodes, features_from_diffusion).
-        num_node_original_from_x = x.shape[1] # This is num_nodes
-        device = x.device
-        d_gamma = d_gamma.to(device) # d_gamma is (time_steps, time_steps)
+        # Ensure d_gamma is on the correct device and potentially batched
+        if d_gamma_batched.dim() == 2: # If a single D_gamma is passed
+            d_gamma_batched = d_gamma_batched.to(device) #.unsqueeze(0).repeat(batch_size, 1, 1)
+        elif d_gamma_batched.dim() == 3 and d_gamma_batched.shape[0] == batch_size:
+            d_gamma_batched = d_gamma_batched.to(device)
+        else:
+            raise ValueError(f"d_gamma shape {d_gamma_batched.shape} is not compatible with batch_size {batch_size}")
 
-        # x is (num_relation, num_nodes, features_from_diffusion)
-        # self.time_dim is `time_steps` (window size)
-        # self.in_dim is the feature dimension for QKV layers after the view.
-        # The view operation: x_viewed = x.view(self.time_dim, -1)
-        # This means x is being reshaped such that its first dimension becomes `self.time_dim` (time_steps).
-        # The elements of x are rearranged.
-        # The total number of elements in x: x.shape[0]*x.shape[1]*x.shape[2]
-        # This must be equal to self.time_dim * (elements / self.time_dim)
-        # The second dim of x_viewed is (x.shape[0]*x.shape[1]*x.shape[2]) / self.time_dim. This is self.in_dim.
-        
-        # Example: u (x) is (5 relations, 30 nodes, 64 features). Total = 5*30*64 = 9600
-        # time_steps (self.time_dim) = 21 (window size)
-        # x_viewed = x.view(21, 9600/21) = x.view(21, 457.14) -> this will fail if not integer.
-        # This implies that the product of (num_relation * num_nodes * features_from_diffusion)
-        # must be divisible by `time_steps` (window_size). This is a strong constraint.
+        batch_outputs = []
+        for b_idx in range(batch_size):
+            # x_sample: (Num_Relations, Num_Nodes, Features_from_Diffusion)
+            x_sample = x_batched[b_idx]
+            
+            # The critical reshape:
+            # x_sample must be reshaped to (self.time_dim, self.in_dim) for QKV.
+            # self.time_dim is, e.g., window_size.
+            # self.in_dim is (Num_Relations * Num_Nodes * Features_from_Diffusion) / self.time_dim
+            # This requires the product of dimensions of x_sample to be divisible by self.time_dim,
+            # and for self.in_dim to be correctly configured during __init__.
+            try:
+                x_reshaped_sample = x_sample.contiguous().view(self.time_dim, self.in_dim)
+            except RuntimeError as e:
+                raise RuntimeError(f"Error reshaping x_sample in ParallelRetention for batch item {b_idx}. "
+                                   f"x_sample shape: {x_sample.shape}, target view: ({self.time_dim}, {self.in_dim}). "
+                                   f"Original error: {e}")
 
-        # Let's re-read the paper's Fig 1. H_l (output of diffusion) goes into Parallel Retention.
-        # H_l is (num_relation, num_nodes, features). D_gamma is (time_dim, time_dim) where time_dim is window size.
-        # The MGDPR model's `self.D_gamma` is (time_dim, time_dim) where `time_dim` is `time_steps` (window).
-        # This `D_gamma` is passed to `retention_layers[l](u, self.D_gamma)`.
-        # This means the retention mechanism *must* operate along the `time_steps` dimension.
-        # However, `u` (output of diffusion) is (num_relation, num_nodes, features_after_diffusion). It has lost the original time_steps dim.
-        # This is a critical point. The `demo.ipynb` code for `ParallelRetention` seems to be applying retention
-        # by reshaping `u` to have `time_steps` as its first dimension. This implies `time_steps` must have been implicitly
-        # encoded or reconstructible from `u`'s dimensions, or there's a misunderstanding of how `u` relates to `time_steps`.
+            q_sample = self.Q_layers(x_reshaped_sample) # (time_dim, inter_dim)
+            k_sample = self.K_layers(x_reshaped_sample) # (time_dim, inter_dim)
+            v_sample = self.V_layers(x_reshaped_sample) # (time_dim, inter_dim)
 
-        # The `retention_layers` in MGDPR are initialized with `ParallelRetention(time_dim, retention_config...)`
-        # where `time_dim` is `time_steps` (window size).
-        # The `D_gamma` used is also based on this `time_steps`.
-        # The input `x` to `ParallelRetention.forward` is `u` from diffusion.
-        # `u` is (num_relation, num_nodes, features_from_diffusion).
-        # The line `x = x.view(self.time_dim, -1)` means `u` is reshaped to `(time_steps, calculated_feature_dim)`.
-        # This `calculated_feature_dim` is what `self.in_dim` (for QKV) should be.
-        # The `retention_layers` config in `demo.ipynb` (lines 797-807) defines `in_dim`, `inter_dim`, `out_dim` for each retention layer.
-        # e.g., `retention[0]` is `num_relation*3*n` (where n is num_nodes). This is the `in_dim` for the first retention layer.
-        # So, `calculated_feature_dim` must be equal to `retention[3*i]`.
-        # (num_relation * num_nodes * features_from_diffusion) / time_steps == retention_config_in_dim
+            inter_feat_sample = torch.matmul(q_sample, k_sample.transpose(0, 1)) # (time_dim, time_dim)
+            
+            current_d_gamma = d_gamma_batched if d_gamma_batched.dim() == 2 else d_gamma_batched[b_idx]
 
-        # Let's assume the reshaping in the notebook is what's intended, and the dimensions align.
-        # `x` is `u` from diffusion: (num_relation, num_nodes, features_from_diffusion_output)
-        # `self.time_dim` is `time_steps` (window size)
-        # `self.in_dim` is the configured input dimension for QKV layers.
-        
-        # The view `x.view(self.time_dim, -1)` implies that the total number of elements in `x`
-        # is `self.time_dim * self.in_dim`.
-        # So, `x.shape[0] * x.shape[1] * x.shape[2] == self.time_dim * self.in_dim`.
-        # This must hold for the view to be valid and for `self.in_dim` to be correctly used by Linear layers.
+            retained_x_sample = torch.matmul(current_d_gamma * inter_feat_sample, v_sample) # (time_dim, inter_dim)
+            
+            output_x_sample = self.activation(self.ret_feat(retained_x_sample)) # (time_dim, out_dim)
 
-        x_reshaped = x.view(self.time_dim, self.in_dim) # This assumes the product of dims matches.
+            # Reshape to (Num_Nodes, Features_after_Retention)
+            # This requires self.time_dim * self.out_dim to be divisible by num_nodes_original.
+            # Features_after_Retention = (self.time_dim * self.out_dim) / num_nodes_original
+            try:
+                final_output_sample = output_x_sample.contiguous().view(num_nodes_original, -1)
+            except RuntimeError as e:
+                 raise RuntimeError(f"Error reshaping output_x_sample in ParallelRetention for batch item {b_idx}. "
+                                   f"output_x_sample shape: {output_x_sample.shape}, target num_nodes: {num_nodes_original}. "
+                                   f"Original error: {e}")
+            batch_outputs.append(final_output_sample)
 
-        q = self.Q_layers(x_reshaped) # (time_dim, inter_dim)
-        k = self.K_layers(x_reshaped) # (time_dim, inter_dim)
-        v = self.V_layers(x_reshaped) # (time_dim, inter_dim)
-
-        # Original: inter_feat = self.Q_layers(x) @ self.K_layers(x).transpose(0, 1)
-        # This implies x was (time_dim, in_dim)
-        # So Q(x) is (time_dim, inter_dim), K(x).T is (inter_dim, time_dim)
-        # QK^T is (time_dim, time_dim)
-        inter_feat = torch.matmul(q, k.transpose(0, 1)) # (time_dim, time_dim)
-        
-        # d_gamma is (time_dim, time_dim)
-        # (d_gamma * inter_feat) is element-wise product (time_dim, time_dim)
-        # Then matmul with V_layers(x) which is `v` (time_dim, inter_dim)
-        # So, (time_dim, time_dim) @ (time_dim, inter_dim) -> this is correct.
-        retained_x = torch.matmul(d_gamma * inter_feat, v) # (time_dim, inter_dim)
-        
-        output_x = self.activation(self.ret_feat(retained_x)) # (time_dim, out_dim)
-
-        # Original: return x.view(num_node, -1)
-        # Here, num_node was x.shape[1] of the input x to forward, which is num_nodes.
-        # output_x is (time_dim, out_dim). We need to reshape it to (num_nodes, something).
-        # This requires time_dim * out_dim == num_nodes * something.
-        # This means (time_steps * out_dim) must be divisible by num_nodes.
-        # The `retention_layers` output dimension `retention[3*i+2]` is `self.out_dim`.
-        # The final `eta` in MGDPR is expected to be (num_nodes, features_after_retention)
-        # for concatenation with transformed h_prime or x.
-        # So, `eta` should be (num_nodes, (time_steps * out_dim) / num_nodes).
-        
-        # This reshaping logic is quite specific and depends heavily on how dimensions are configured.
-        # The paper's Fig 1 shows eta(H_l) then concatenated.
-        # If H_l is (num_rel, num_nodes, feat_diff), and eta is (num_nodes, feat_ret),
-        # this implies retention somehow aggregates or transforms across relations and time_steps.
-
-        # Given the notebook's return `x.view(num_node_original_from_x, -1)`:
-        return output_x.view(num_node_original_from_x, -1)
+        # Stack outputs for all batch items
+        # Resulting shape: (Batch_Size, Num_Nodes, Features_after_Retention)
+        return torch.stack(batch_outputs, dim=0)
 
 
 class MGDPR(nn.Module):
@@ -285,9 +267,18 @@ class MGDPR(nn.Module):
 
 
         self.diffusion_layers = nn.ModuleList(
-            [MultiReDiffusion(diffusion_config[i], diffusion_config[i + 1], num_relation)
-             for i in range(len(diffusion_config) - 1)]
+            # diffusion_config is [in0, out0, in1, out1, ...]
+            # Each MultiReDiffusion layer corresponds to an MGDPR block.
+            # The number of such blocks is self.layers.
+            # The number of pairs in diffusion_config should be self.layers.
+            [MultiReDiffusion(diffusion_config[2*i], diffusion_config[2*i + 1], num_relation)
+             for i in range(len(diffusion_config) // 2)]
         )
+        # Ensure the number of created diffusion layers matches self.layers
+        if len(self.diffusion_layers) != self.layers:
+            raise ValueError(f"Mismatch between number of MGDPR layers ({self.layers}) and "
+                             f"diffusion_layers created ({len(self.diffusion_layers)}) from diffusion_config. "
+                             f"Expected diffusion_config to have {self.layers * 2} elements.")
 
         # retention_config is a flat list: [in0, inter0, out0, in1, inter1, out1, ...]
         self.retention_layers = nn.ModuleList(
@@ -311,141 +302,101 @@ class MGDPR(nn.Module):
         )
         self.activation_mlp = nn.PReLU() # Assuming PReLU based on other activations, or could be configurable
 
-    def forward(self, x, a):
-        # x: input node features (batch_size, num_nodes, feature_dim_initial) or (num_relation, num_nodes, feature_dim_initial)
-        #    The demo.ipynb loads X as (num_features/relations, num_nodes, time_window_size)
-        #    The model's diffusion_layers expect x[rel] to be (num_nodes, features_for_that_relation)
-        #    So, input x to MGDPR should be (num_relation, num_nodes, time_window_size_as_features)
-        # a: adjacency tensor (num_relation, num_nodes, num_nodes)
-        device = x.device
-        h = x.to(device) # h is (num_relation, num_nodes, features)
+    def forward(self, x_batch, a_batch):
+        # x_batch: (Batch_Size, Num_Relations, Num_Nodes, Features_Initial)
+        # a_batch: (Batch_Size, Num_Relations, Num_Nodes, Num_Nodes)
         
-        h_prime_retained = None # To store the output of the previous layer's retention block for skip connection
+        device = x_batch.device
+        batch_size = x_batch.shape[0]
+
+        # h_for_diffusion is the input to the diffusion part of each MGDPR layer.
+        # Initialized with x_batch. Shape: (B, R, N, F_in)
+        h_for_diffusion = x_batch.to(device)
+        
+        # h_prime_retained_for_skip is the output of the retention block (after ret_linear_2) from the *previous* MGDPR layer.
+        # This is used for the skip connection in the current MGDPR layer's retention block.
+        # Initialized to None, special handling for l_layer_idx == 0.
+        # Shape: (B, N, F_from_prev_rl2)
+        h_prime_retained_for_skip = None
+
+        # This will store the final output of the retention block for the current layer, to be used by MLP.
+        # Shape: (B, N, F_mlp_in_features)
+        final_layer_output_for_mlp = None
 
         for l_layer_idx in range(self.layers):
-            # Multi-relational Graph Diffusion layer
-            # diffusion_layers[l] expects (theta_l, T_l, a, h_current_input)
-            # h_current_input should be (num_relation, num_nodes, features_for_diffusion_input)
-            # Output h_diffused is (num_relation, num_nodes, features_from_diffusion_output)
-            # Output u_intermediate is also (num_relation, num_nodes, features_from_diffusion_output) - same as h_diffused
+            # --- Multi-relational Graph Diffusion ---
+            # Input h_for_diffusion: (B, R, N, F_current_diffusion_input)
+            # Output h_diffused, u_intermediate: (B, R, N, F_diffusion_output)
             h_diffused, u_intermediate = self.diffusion_layers[l_layer_idx](
-                self.theta[l_layer_idx], self.T[l_layer_idx], a, h
+                self.theta[l_layer_idx],  # (R, ExpSteps)
+                self.T[l_layer_idx],      # (R, ExpSteps, N, N)
+                a_batch,                  # (B, R, N, N)
+                h_for_diffusion           # (B, R, N, F_current_diffusion_input)
             )
-            h = h_diffused # Update h for the next diffusion layer's input (if layers > 1 for diffusion part)
-                           # Or h is the input to the retention part of the current MGDPR layer.
-
-            u_intermediate = u_intermediate.to(device) # u is input to retention
-
-            # Parallel Retention layer
-            # retention_layers[l] expects (u_intermediate, D_gamma)
-            # D_gamma is (time_dim, time_dim) where time_dim is window_size
-            # u_intermediate is (num_relation, num_nodes, features_from_diffusion)
-            # Output eta is (num_nodes, features_after_retention) due to the view in ParallelRetention
-            eta = self.retention_layers[l_layer_idx](u_intermediate, self.D_gamma)
-            eta = eta.to(device)
-
-            # Decoupled representation transform
-            if l_layer_idx == 0:
-                # Original input x to MGDPR is (num_relation, num_nodes, initial_features_time_window)
-                # We need to transform x to match eta's shape for concatenation, or transform x to (num_nodes, features)
-                # The notebook code: x_reshaped = x.view(x.shape[1], -1)
-                # This means x (num_relation, num_nodes, init_feat_len) -> (num_nodes, num_relation * init_feat_len)
-                # This x_reshaped is then passed to ret_linear_1[l].
-                # So, input to ret_linear_1[0] is (num_nodes, num_relation * init_feat_len)
-                if x.dim() == 3: # Assuming x is (num_relation, num_nodes, feature_dim)
-                    x_transformed_for_skip = x.permute(1,0,2).contiguous().view(self.num_nodes, -1)
-                elif x.dim() == 2: # If x was already (num_nodes, features)
-                     x_transformed_for_skip = x
-                else:
-                    raise ValueError(f"Initial x has unexpected dimension: {x.dim()}")
-
-                transformed_skip = self.ret_linear_1[l_layer_idx](x_transformed_for_skip)
-                h_concat = torch.cat((eta, transformed_skip), dim=1)
-                h_prime_retained = self.ret_linear_2[l_layer_idx](h_concat)
-            else:
-                # h_prime_retained is from previous layer, (num_nodes, features_from_ret_linear_2)
-                transformed_skip = self.ret_linear_1[l_layer_idx](h_prime_retained)
-                h_concat = torch.cat((eta, transformed_skip), dim=1)
-                h_prime_retained = self.ret_linear_2[l_layer_idx](h_concat)
             
-            # The output of this block, h_prime_retained, becomes the input `h` for the *diffusion part* of the next MGDPR layer.
-            # This means h_prime_retained (num_nodes, features) needs to be transformed back to
-            # (num_relation, num_nodes, features) if the next diffusion layer expects that.
-            # However, the diffusion layer's fc_layers take input_dim.
-            # The MGDPR paper's Fig 1 shows H'_l is the final output of layer l.
-            # And H_l (output of diffusion) is input to retention. H_0 is X.
-            # H_l = Diffusion(H'_{l-1}, A). Eta_l = Retention(H_l). H'_l = Linear(concat(Eta_l, Linear(H'_{l-1})))
-            # This means `h` for the next layer's diffusion should be `h_prime_retained` from current layer.
-            # If diffusion expects (num_relation, num_nodes, features), then h_prime_retained needs reshaping/broadcasting.
-            # The current `h` for diffusion is (num_relation, num_nodes, features).
-            # `h_prime_retained` is (num_nodes, features).
-            # This implies `h` for the next diffusion layer needs to be adapted from `h_prime_retained`.
-            # The notebook code for MGDPR.forward has `h` (input to diffusion) being updated by `h, u = self.diffusion_layers[l](...)`.
-            # Then `h_prime` (output of retention block) is calculated. This `h_prime` is NOT fed back as `h` to the next diffusion.
-            # Instead, the `h` from `self.diffusion_layers[l]` seems to be the input to `self.diffusion_layers[l+1]`.
-            # This means `h_prime_retained` is the progressive output that goes to MLP.
-            # And `h` (output of diffusion) is what's iterated for the diffusion part across layers.
+            # Update h_for_diffusion for the *next* MGDPR layer's diffusion part.
+            h_for_diffusion = h_diffused
+            u_intermediate = u_intermediate.to(device) # (B, R, N, F_diffusion_output)
 
-            # Let's re-check notebook MGDPR forward:
-            # h = x (initial)
-            # loop l:
-            #   h, u = diffusion_layers[l](..., h)  <- h is updated here by diffusion output
-            #   eta = retention_layers[l](u, ...)
-            #   if l==0: h_prime = cat(eta, linear(x_reshaped))
-            #   else: h_prime = cat(eta, linear(h_prime_from_prev_iteration)) <- h_prime is iterated for retention skip
-            # The final h_prime is returned after MLP.
-            # This means `h` for diffusion is indeed iterated from diffusion output.
-            # And `h_prime_retained` is the result of the retention path.
+            # --- Parallel Retention ---
+            # Input u_intermediate: (B, R, N, F_diffusion_output)
+            # Input self.D_gamma: (Time_Dim_Ret, Time_Dim_Ret) - not batched, handled by ParallelRetention
+            # Output eta_batch: (B, N, F_retention_output)
+            eta_batch = self.retention_layers[l_layer_idx](u_intermediate, self.D_gamma)
+            eta_batch = eta_batch.to(device)
 
-            # So, the `h = h_diffused` line earlier was correct for iterating the diffusion part.
-            # `h_prime_retained` is the one that gets processed by MLP at the end.
-            if l_layer_idx < self.layers -1 : # If not the last layer, prepare 'h' for the next diffusion
-                # The output of ret_linear_2 (h_prime_retained) is (num_nodes, features).
-                # The input to diffusion (h) needs to be (num_relation, num_nodes, features).
-                # This is where the "decoupled" nature might be tricky.
-                # The paper says: H_l = sigma(Conv2d(Delta(S_lr H_{l-1} W_l^r))). This H_{l-1} is the input to diffusion.
-                # And H'_l = sigma((eta(H_l) || (H'_{l-1} W^1_l + b^1_l)) W^2_l + b^2_l)
-                # The output of layer l-1 is H'_{l-1}. This H'_{l-1} is used as input to layer l's diffusion (as H_{l-1})
-                # and also in the skip connection for H'_l.
-                # So, h (input to diffusion_layers[l]) should be h_prime_retained from layer l-1.
-                # And x (initial features) is H'_{-1} effectively.
+            # --- Decoupled Representation Transform (Skip Connections) ---
+            if l_layer_idx == 0:
+                # For the first layer, the skip connection comes from the initial input x_batch.
+                # x_batch: (B, R, N, F_initial)
+                # Reshape for ret_linear_1: (B, N, R * F_initial)
+                if x_batch.dim() == 4: # (B, R, N, F_initial)
+                    # Permute to (B, N, R, F_initial) then view as (B, N, R * F_initial)
+                    skip_connection_source = x_batch.permute(0, 2, 1, 3).contiguous().view(batch_size, self.num_nodes, -1)
+                else:
+                    raise ValueError(f"Initial x_batch has unexpected dimension: {x_batch.dim()}, expected 4D (B,R,N,F)")
+            else:
+                # For subsequent layers, the skip connection comes from the previous layer's h_prime_retained_for_skip.
+                # h_prime_retained_for_skip: (B, N, F_from_prev_rl2)
+                skip_connection_source = h_prime_retained_for_skip
+            
+            # transformed_skip: (B, N, F_rl1_output)
+            transformed_skip = self.ret_linear_1[l_layer_idx](skip_connection_source)
+            
+            # h_concat: (B, N, F_eta + F_rl1_output)
+            h_concat = torch.cat((eta_batch, transformed_skip), dim=2) # Concatenate along the feature dimension
+            
+            # current_h_prime_retained: (B, N, F_rl2_output)
+            current_h_prime_retained = self.ret_linear_2[l_layer_idx](h_concat)
+            
+            # This output becomes the skip connection source for the next layer.
+            h_prime_retained_for_skip = current_h_prime_retained
+            
+            # If this is the last MGDPR layer, its output is what goes to the MLP.
+            if l_layer_idx == self.layers - 1:
+                final_layer_output_for_mlp = current_h_prime_retained
 
-                # Corrected loop structure based on paper:
-                # h_current_layer_input = x if l_layer_idx == 0 else h_prime_output_from_previous_layer
-                # h_diffused, u_intermediate = self.diffusion_layers[l_layer_idx](..., h_current_layer_input)
-                # ... calculate eta ...
-                # skip_connection_input = x_transformed_for_skip if l_layer_idx == 0 else h_prime_output_from_previous_layer
-                # ... calculate h_prime_retained ...
-                # h_prime_output_from_previous_layer = h_prime_retained (for next iteration)
+        # --- MLP Post-processing ---
+        # final_layer_output_for_mlp should be (B, N, F_mlp_input)
+        if final_layer_output_for_mlp is None:
+             # This case should ideally not happen if self.layers > 0
+            if self.layers == 0: # If no MGDPR layers, MLP processes initial x transformed.
+                if x_batch.dim() == 4:
+                    current_rep_for_mlp = x_batch.permute(0, 2, 1, 3).contiguous().view(batch_size, self.num_nodes, -1)
+                else: # Should not happen with current DataLoader
+                    raise ValueError("x_batch has unexpected shape for MLP input when layers=0")
+            else: # Should not be reached if loop ran
+                raise ValueError("final_layer_output_for_mlp is None after MGDPR layers.")
+        else:
+            current_rep_for_mlp = final_layer_output_for_mlp
 
-                # Let's adjust the loop variable `h` which is input to diffusion.
-                # And `h_prime_retained` is the actual output of the MGDPR layer `l`.
-                pass # h_prime_retained will be used by MLP after the loop.
-                     # The `h` for diffusion needs to be managed carefully.
-
-        # The loop in the notebook implies `h` (for diffusion) and `h_prime` (for retention output) evolve somewhat separately,
-        # with `h_prime` using the *original* `x` or the *previous* `h_prime` for its skip.
-        # The `h` for diffusion is taken from the output of the *previous diffusion*.
-        # This means the `h = h_diffused` line was key.
-        # The final `h_prime_retained` after all layers is what goes to MLP.
-
-        final_representation = h_prime_retained # This is (num_nodes, features)
-        
-        for mlp_layer in self.mlp:
-            final_representation = self.activation_mlp(mlp_layer(final_representation)) # Added activation
-            # The last layer of MLP might not need activation if it's for logits (e.g. CrossEntropyLoss)
-            # If last MLP layer is `nn.Linear(..., num_classes)`, then no activation here.
-            # The demo notebook uses CrossEntropyLoss, so last MLP output should be logits.
-            # Let's apply activation only for hidden MLP layers.
-        
-        # Refined MLP processing:
-        current_rep = h_prime_retained
         for i, mlp_layer in enumerate(self.mlp):
-            current_rep = mlp_layer(current_rep)
+            current_rep_for_mlp = mlp_layer(current_rep_for_mlp)
             if i < len(self.mlp) - 1: # Apply activation to all but the last MLP layer
-                current_rep = self.activation_mlp(current_rep)
+                current_rep_for_mlp = self.activation_mlp(current_rep_for_mlp)
         
-        return current_rep # (num_nodes, num_classes)
+        # Output: (Batch_Size, Num_Nodes, Num_Classes)
+        return current_rep_for_mlp
 
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.T)
