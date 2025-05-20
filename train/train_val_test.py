@@ -1,14 +1,17 @@
 import sys
 import os
+import argparse # Added for command-line arguments
 # Add project root to Python path to allow sibling module imports (dataset, model)
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import torch
 import torch.profiler # For PyTorch Profiler
+from torch.profiler import record_function # Import for explicit recording blocks
 import csv
 from datetime import datetime, timedelta # Added import
 import torch.nn.functional as F
 import pandas as pd # Added for MultiIndex DataFrame
+from torch.cuda.amp import autocast, GradScaler # Added for mixed-precision training
 # import torch.distributions # Not explicitly used in the notebook's training script part
 from sklearn.metrics import matthews_corrcoef, f1_score
 from torch.utils.data import DataLoader # Added for DataLoader optimization
@@ -19,6 +22,23 @@ from model.Multi_GDNN import MGDPR
 # Configure the device for running the model on GPU or CPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
+
+# --- Argument Parsing ---
+parser = argparse.ArgumentParser(description="Train MGDPR model with configurable DataLoader and Profiler parameters.")
+parser.add_argument('--batch_size', type=int, default=32, help='Batch size for DataLoader.')
+parser.add_argument('--num_workers', type=int, default=os.cpu_count() // 2 if os.cpu_count() else 4, help='Number of worker processes for data loading.')
+parser.add_argument('--pin_memory', type=lambda x: (str(x).lower() == 'true'), default=True, help='Pin memory for faster CPU to GPU data transfer (True/False).')
+parser.add_argument('--use_amp', type=lambda x: (str(x).lower() == 'true'), default=True, help='Enable Automatic Mixed Precision (AMP) training (True/False).')
+
+# Profiler arguments
+parser.add_argument('--profile', type=lambda x: (str(x).lower() == 'true'), default=False, help='Enable PyTorch profiler (True/False).')
+parser.add_argument('--profile-steps', type=int, default=5, help='Number of active steps/batches for the profiler to record.')
+parser.add_argument('--profile-wait', type=int, default=1, help='Number of wait steps before profiler starts recording.')
+parser.add_argument('--profile-warmup', type=int, default=1, help='Number of warmup steps before active recording.')
+parser.add_argument('--profile-epoch', type=int, default=0, help='Target epoch index (0-based) to run profiling.')
+parser.add_argument('--profile-log-dir', type=str, default="./mgdpr_profiler_logs", help='Directory to save profiler trace files.')
+
+args = parser.parse_args()
 
 # --- Configuration Section ---
 # These paths and parameters are from the demo.ipynb and may need adjustment for local execution.
@@ -57,14 +77,12 @@ root_data_dir = "/workspaces/ai_testground/shortlist_stocks-1.csv" # Path to the
 # TODO: Update this path to where you want processed graph data saved
 graph_dest_dir = "./graph_data_processed" # Example: "data/processed_graph_data"
 
-# --- DataLoader Configuration ---
-BATCH_SIZE = 32  # Batch size for DataLoader, adjust as needed
-# Number of worker processes for data loading.
-# Start with 4; good values often range from os.cpu_count() // 2 to os.cpu_count().
-# Too many workers can sometimes increase overhead.
-NUM_WORKERS = 4
-# Pin memory for faster CPU to GPU data transfer if CUDA is available.
-PIN_MEMORY = True # As per optimization requirement
+# --- DataLoader Configuration (from parsed arguments) ---
+BATCH_SIZE = args.batch_size
+NUM_WORKERS = args.num_workers
+PIN_MEMORY = args.pin_memory
+print(f"DataLoader Configuration: BATCH_SIZE={BATCH_SIZE}, NUM_WORKERS={NUM_WORKERS}, PIN_MEMORY={PIN_MEMORY}")
+
 
 # --- Load Company Lists ---
 # This section is based on the notebook's logic for loading company lists.
@@ -412,24 +430,25 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 criterion = F.cross_entropy # Using criterion directly
 
 # --- Training, Validation, and Testing ---
-# --- Profiler Configuration ---
-# Controls whether profiling is enabled for a few batches in a target epoch.
-# Set to False to disable profiling completely.
-PROFILE_ENABLED = True
-PROFILE_EPOCH_TARGET = 0  # Profile batches in the first epoch (epoch index 0).
-PROFILE_BATCHES_TO_RUN = 5  # Number of batches to profile within the target epoch.
-PROFILER_LOG_DIR = "./mgdpr_profiler_logs"  # Directory for TensorBoard and Chrome traces.
+# --- Profiler Configuration (from parsed arguments) ---
+PROFILE_ENABLED = args.profile
+PROFILE_EPOCH_TARGET = args.profile_epoch
+PROFILE_ACTIVE_STEPS = args.profile_steps # This is the 'active' duration in the schedule
+PROFILE_WAIT_STEPS = args.profile_wait
+PROFILE_WARMUP_STEPS = args.profile_warmup
+PROFILER_LOG_DIR = args.profile_log_dir
+PROFILE_REPEAT_CYCLES = 1 # Number of times to repeat the wait, warmup, active cycle; typically 1 for a short profiling run.
 
-# Create profiler log directory if it doesn't exist
+# Create profiler log directory if it doesn't exist and profiling is enabled
 if PROFILE_ENABLED and not os.path.exists(PROFILER_LOG_DIR):
     os.makedirs(PROFILER_LOG_DIR, exist_ok=True)
-    print(f"Profiler log directory created: {PROFILER_LOG_DIR}")
+    print(f"Profiler log directory will be used/created: {PROFILER_LOG_DIR}")
 
 # Helper function for a single training step to avoid code duplication
-def train_batch(batch_sample, model, criterion, optimizer, device, is_profiling=False, profiler_context=None):
+# profiler_context argument removed as prof.step() is handled by schedule, and record_function is global
+def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_amp, is_profiling=False):
     """
     Processes a single batch of training data.
-    If profiling, profiler_context.step() is called.
     """
     X = batch_sample['X'].to(device)
     A = batch_sample['A'].to(device)
@@ -438,30 +457,54 @@ def train_batch(batch_sample, model, criterion, optimizer, device, is_profiling=
     optimizer.zero_grad(set_to_none=True) # Use set_to_none=True for potential minor perf gain
     
     # Forward pass
-    out_logits = model(X, A) # Expected shape: (Batch_Size, Num_Nodes, Num_Classes) e.g. (32, 9, 2)
-    
-    # Calculate loss
-    # criterion (F.cross_entropy) expects input (logits) as (N, C, ...) and target (labels) as (N, ...)
-    # Current out_logits: (Batch_Size, Num_Nodes, Num_Classes) -> (32, 9, 2)
-    # Current C_labels:   (Batch_Size, Num_Nodes)           -> (32, 9)
-    # We need to permute out_logits to (Batch_Size, Num_Classes, Num_Nodes) for cross_entropy.
-    # So, (32, 2, 9)
-    out_logits_permuted = out_logits.permute(0, 2, 1) # (Batch_Size, Num_Classes, Num_Nodes)
-    
-    loss = criterion(out_logits_permuted, C_labels)
+    with autocast(enabled=use_amp):
+        if is_profiling:
+            with record_function("model_forward"): # Use the imported record_function
+                out_logits = model(X, A) # Expected shape: (Batch_Size, Num_Nodes, Num_Classes) e.g. (32, 9, 2)
+        else:
+            out_logits = model(X, A)
+        
+        # Calculate loss
+        # criterion (F.cross_entropy) expects input (logits) as (N, C, ...) and target (labels) as (N, ...)
+        # Current out_logits: (Batch_Size, Num_Nodes, Num_Classes) -> (32, 9, 2)
+        # Current C_labels:   (Batch_Size, Num_Nodes)           -> (32, 9)
+        # We need to permute out_logits to (Batch_Size, Num_Classes, Num_Nodes) for cross_entropy.
+        # So, (32, 2, 9)
+        out_logits_permuted = out_logits.permute(0, 2, 1) # (Batch_Size, Num_Classes, Num_Nodes)
+        
+        loss = criterion(out_logits_permuted, C_labels)
     
     # Backward pass and optimization
-    loss.backward()
-    optimizer.step()
+    if use_amp:
+        if is_profiling:
+            with record_function("model_backward_amp"):
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+        else:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+    else:
+        if is_profiling:
+            with record_function("model_backward_no_amp"):
+                loss.backward()
+                optimizer.step()
+        else:
+            loss.backward()
+            optimizer.step()
     
-    # Signal profiler step if profiling is active for this batch
-    if is_profiling and profiler_context:
-         profiler_context.step()
+    # profiler.step() is now handled by the schedule, so no manual call here.
 
     return loss, out_logits, C_labels
 
-epochs = 10 # Reduced for quick testing, notebook uses 10000
+epochs = 2 # Reduced for quick testing, notebook uses 10000
 model.reset_parameters()
+
+# --- AMP Scaler ---
+use_amp_flag = args.use_amp and torch.cuda.is_available() and device.type == 'cuda'
+scaler = GradScaler(enabled=use_amp_flag)
+print(f"Automatic Mixed Precision (AMP) {'enabled' if use_amp_flag else 'disabled'}.")
 
 print("Starting training...")
 for epoch in range(epochs):
@@ -482,116 +525,177 @@ for epoch in range(epochs):
     is_profiling_active_epoch = PROFILE_ENABLED and epoch == PROFILE_EPOCH_TARGET
 
     if is_profiling_active_epoch:
-        print(f"--- Profiling enabled for Epoch {epoch+1}, first {PROFILE_BATCHES_TO_RUN} batches ---")
+        print(f"--- Profiling enabled for Epoch {epoch+1} ---")
         activities = [torch.profiler.ProfilerActivity.CPU]
         if torch.cuda.is_available() and device.type == 'cuda': # Check if CUDA is actually used
             activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-        # on_trace_ready handler for TensorBoard.
-        # Called when the profiler context exits (if no schedule) or at schedule cycle end.
-        tensorboard_trace_handler = torch.profiler.tensorboard_trace_handler(PROFILER_LOG_DIR)
         
+        profiler_schedule = torch.profiler.schedule(
+            wait=PROFILE_WAIT_STEPS,
+            warmup=PROFILE_WARMUP_STEPS,
+            active=PROFILE_ACTIVE_STEPS,
+            repeat=PROFILE_REPEAT_CYCLES
+        )
+        print(f"Profiler schedule: wait={PROFILE_WAIT_STEPS}, warmup={PROFILE_WARMUP_STEPS}, active={PROFILE_ACTIVE_STEPS}, repeat={PROFILE_REPEAT_CYCLES}")
+        
+        # Define the trace handler
+        trace_handler = torch.profiler.tensorboard_trace_handler(
+            PROFILER_LOG_DIR,
+            worker_name=f"worker_epoch{epoch}" # Optional: add worker name for distributed training, or just keep it simple
+        ) if PROFILE_ENABLED else None # Only create handler if profiling
+
         # Profiler context manager
         with torch.profiler.profile(
             activities=activities,
-            profile_memory=True,      # Capture memory usage
-            record_shapes=True,     # Record tensor shapes
-            with_stack=True,        # Record call stacks
-            on_trace_ready=tensorboard_trace_handler # Enable TensorBoard output
-            # For this initial setup, a schedule is not used. profiler_context.step() marks iterations.
+            schedule=profiler_schedule,
+            profile_memory=True,    # Enable memory profiling
+            record_shapes=True,     # Enable shape recording for better analysis
+            with_stack=True,        # Enable stack tracing for more detailed source attribution
+            on_trace_ready=trace_handler # Use the configured trace handler
         ) as prof:
-            # Profile the first PROFILE_BATCHES_TO_RUN batches
-            for i, sample in enumerate(train_loader): # Changed from train_dataset to train_loader
-                if i >= PROFILE_BATCHES_TO_RUN:
-                    break # Stop profiling after N batches
+            # The loop needs to run for enough batches for the schedule to complete one cycle.
+            num_batches_for_profiling_cycle = PROFILE_WAIT_STEPS + PROFILE_WARMUP_STEPS + (PROFILE_ACTIVE_STEPS * PROFILE_REPEAT_CYCLES)
+            print(f"Running profiling for up to {num_batches_for_profiling_cycle} batches to cover schedule...")
+            
+            for i, sample in enumerate(train_loader):
+                if i >= num_batches_for_profiling_cycle:
+                    print(f"Reached {i} batches, stopping profiling loop for this epoch.")
+                    break # Stop after enough batches for the schedule
                 
-                # Process batch using helper, passing profiler context
-                loss, out_logits, C_labels = train_batch(sample, model, criterion, optimizer, device,
-                                                         is_profiling=True, profiler_context=prof)
+                loss, out_logits, C_labels = train_batch(sample, model, criterion, optimizer, device, scaler, use_amp_flag,
+                                                         is_profiling=True)
                 
                 epoch_loss_sum += loss.item()
-                # Predictions should be based on the original out_logits shape (Batch, Num_Nodes, Num_Classes)
-                # argmax over the Num_Classes dimension (dim=2)
-                preds = out_logits.argmax(dim=2) # Shape: (Batch_Size, Num_Nodes)
+                preds = out_logits.argmax(dim=2)
                 epoch_correct += (preds == C_labels).sum().item()
-                epoch_total_samples += C_labels.numel() # Total number of node-level predictions
+                epoch_total_samples += C_labels.numel()
                 
                 batch_num_display = i + 1
-                total_batches_in_dataset = len(train_loader) # Changed from train_dataset to train_loader
-                print(f"Epoch {epoch+1}/{epochs}, Batch {batch_num_display}/{total_batches_in_dataset} (Profiling): Loss={loss.item():.4f}")
+                # prof.step() is called by the profiler due to the schedule
+                # Determine if currently in active recording phase for logging
+                current_profiling_batch_num = -1
+                if i >= PROFILE_WAIT_STEPS + PROFILE_WARMUP_STEPS:
+                    current_profiling_batch_num = i - (PROFILE_WAIT_STEPS + PROFILE_WARMUP_STEPS) + 1
+                
+                log_message_profiling_phase = ""
+                if current_profiling_batch_num > 0 and current_profiling_batch_num <= PROFILE_ACTIVE_STEPS:
+                    log_message_profiling_phase = f"(Profiling active batch {current_profiling_batch_num} of {PROFILE_ACTIVE_STEPS})"
+                elif i < PROFILE_WAIT_STEPS:
+                    log_message_profiling_phase = f"(Profiler waiting, batch {i+1} of {PROFILE_WAIT_STEPS})"
+                elif i < PROFILE_WAIT_STEPS + PROFILE_WARMUP_STEPS:
+                    log_message_profiling_phase = f"(Profiler warming up, batch {i+1-PROFILE_WAIT_STEPS} of {PROFILE_WARMUP_STEPS})"
 
-            # Export Chrome trace after the profiled section (when the 'with prof:' block ends)
-            # This is in addition to the TensorBoard trace from on_trace_ready.
-            chrome_trace_filename = f"profile_epoch_{epoch+1}_first_{PROFILE_BATCHES_TO_RUN}_batches.json"
-            chrome_trace_path = os.path.join(PROFILER_LOG_DIR, chrome_trace_filename)
+                print(f"Epoch {epoch+1}/{epochs}, Batch {batch_num_display}/{len(train_loader)} {log_message_profiling_phase}: Loss={loss.item():.4f}")
+            
+            # --- Detailed Profiler Output (Inside 'with prof:' block, after the loop) ---
+            print("\n--- Checking Raw Profiler Events (inside profiler context, after loop) ---")
+            raw_events = prof.events()
+            print(f"Number of raw events collected: {len(raw_events)}")
+            if len(raw_events) > 0:
+                print("First 5 raw events (if any):")
+                for event_idx, event in enumerate(raw_events):
+                    if event_idx >= 5: break
+                    event_name = getattr(event, 'name', 'N/A')
+                    cpu_time = getattr(event, 'cpu_time_total', 'N/A')
+                    cuda_time = getattr(event, 'cuda_time_total', 'N/A')
+                    thread_id = getattr(event, 'thread', 'N/A')
+                    print(f"  Event {event_idx}: Name: {event_name}, CPU time: {cpu_time} us, CUDA time: {cuda_time} us, Thread: {thread_id}")
+            else:
+                print("No raw events were collected by the profiler or available.")
+
+            print("\n--- PyTorch Profiler Key Averages (inside profiler context, after loop) ---")
+            key_avg_obj = prof.key_averages()
+            print(key_avg_obj)
+
+            if not key_avg_obj:
+                print("Profiler key_averages() returned an empty or None object.")
+            else:
+                print("\n--- PyTorch Profiler CPU Summary (Self Time) ---")
             try:
-                prof.export_chrome_trace(chrome_trace_path)
-                print(f"Chrome profiler trace saved to {chrome_trace_path}")
+                print(key_avg_obj.table(sort_by="self_cpu_time_total", row_limit=15, header="Self CPU Time Total"))
             except Exception as e:
-                print(f"Error exporting Chrome trace: {e}")
-            print(f"TensorBoard traces (if generated by on_trace_ready) are in {PROFILER_LOG_DIR}")
+                print(f"Error generating CPU self time table: {e}")
+            
+            print("\n--- PyTorch Profiler CPU Summary (Total Time) ---")
+            try:
+                print(key_avg_obj.table(sort_by="cpu_time_total", row_limit=15, header="Total CPU Time"))
+            except Exception as e:
+                print(f"Error generating CPU total time table: {e}")
+            
+            if torch.profiler.ProfilerActivity.CUDA in activities:
+                print("\n--- PyTorch Profiler CUDA Summary (Self Time) ---")
+                try:
+                    print(key_avg_obj.table(sort_by="self_cuda_time_total", row_limit=15, header="Self CUDA Time Total"))
+                except Exception as e:
+                    print(f"Error generating CUDA self time table: {e}")
+
+                print("\n--- PyTorch Profiler CUDA Summary (Total Time) ---")
+                try:
+                    print(key_avg_obj.table(sort_by="cuda_time_total", row_limit=15, header="Total CUDA Time"))
+                except Exception as e:
+                    print(f"Error generating CUDA total time table: {e}")
+            print("--- End of Profiler Summary (inside profiler context) ---\n")
 
         # Continue with the rest of the batches for this epoch (if any) without profiling
-        start_batch_idx_after_profiling = PROFILE_BATCHES_TO_RUN
-        if start_batch_idx_after_profiling < len(train_loader): # Changed from train_dataset to train_loader
-            print(f"--- Continuing Epoch {epoch+1} after profiling ({start_batch_idx_after_profiling}/{len(train_loader)}) ---") # Changed
-            for i, sample in enumerate(train_loader): # Changed from train_dataset to train_loader
+        start_batch_idx_after_profiling = num_batches_for_profiling_cycle
+        
+        if start_batch_idx_after_profiling < len(train_loader): 
+            print(f"--- Continuing Epoch {epoch+1} after profiling ({start_batch_idx_after_profiling}/{len(train_loader)}) ---") 
+            for i, sample in enumerate(train_loader): 
                 if i < start_batch_idx_after_profiling:
                     continue # Skip already processed (profiled) batches
 
-                # Process batch using helper, not profiling here
-                loss, out_logits, C_labels = train_batch(sample, model, criterion, optimizer, device,
-                                                         is_profiling=False, profiler_context=None)
+                loss, out_logits, C_labels = train_batch(sample, model, criterion, optimizer, device, scaler, use_amp_flag,
+                                                         is_profiling=False)
                 
                 epoch_loss_sum += loss.item()
-                preds = out_logits.argmax(dim=2) # Shape: (Batch_Size, Num_Nodes)
+                preds = out_logits.argmax(dim=2)
                 epoch_correct += (preds == C_labels).sum().item()
-                epoch_total_samples += C_labels.numel() # Total number of node-level predictions
-                if (i + 1) % 10 == 0: # Standard logging for non-profiled part
-                     print(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(train_loader)}: Loss={loss.item():.4f}") # Changed
+                epoch_total_samples += C_labels.numel()
+                if (i + 1) % 10 == 0:
+                     print(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(train_loader)}: Loss={loss.item():.4f}")
     
     else: # Regular training for epochs not targeted for profiling (or if PROFILE_ENABLED is False)
-        for i, sample in enumerate(train_loader): # Changed from train_dataset to train_loader
-            # Process batch using helper, not profiling here
-            loss, out_logits, C_labels = train_batch(sample, model, criterion, optimizer, device,
-                                                     is_profiling=False, profiler_context=None)
+        for i, sample in enumerate(train_loader):
+            loss, out_logits, C_labels = train_batch(sample, model, criterion, optimizer, device, scaler, use_amp_flag,
+                                                     is_profiling=False)
             
             epoch_loss_sum += loss.item()
-            preds = out_logits.argmax(dim=2) # Shape: (Batch_Size, Num_Nodes)
+            preds = out_logits.argmax(dim=2)
             epoch_correct += (preds == C_labels).sum().item()
-            epoch_total_samples += C_labels.numel() # Total number of node-level predictions
+            epoch_total_samples += C_labels.numel()
             if (i + 1) % 10 == 0:
-                 print(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(train_loader)}: Loss={loss.item():.4f}") # Changed
+                 print(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(train_loader)}: Loss={loss.item():.4f}")
 
     # Epoch summary (common for all cases)
-    if epoch_total_samples > 0: # Check if any samples were processed
-        num_batches_in_loader = len(train_loader) # Total batches in the loader for this epoch
-        avg_epoch_loss = epoch_loss_sum / num_batches_in_loader if num_batches_in_loader > 0 else 0.0 # Changed
+    if epoch_total_samples > 0:
+        num_batches_in_loader = len(train_loader)
+        avg_epoch_loss = epoch_loss_sum / num_batches_in_loader if num_batches_in_loader > 0 else 0.0
         avg_epoch_acc = epoch_correct / epoch_total_samples
         print(f"Epoch {epoch+1}/{epochs} Summary: Avg Loss={avg_epoch_loss:.4f}, Avg Acc={avg_epoch_acc:.4f}")
-    elif len(train_loader) > 0: # Loader not empty, but no samples processed (e.g. if BATCH_SIZE > len(dataset))
-        print(f"Epoch {epoch+1}/{epochs} Summary: No samples processed in this epoch (loader size: {len(train_loader)}, dataset size: {len(train_dataset)}).") # Changed
+    elif len(train_loader) > 0:
+        print(f"Epoch {epoch+1}/{epochs} Summary: No samples processed in this epoch (loader size: {len(train_loader)}, dataset size: {len(train_dataset)}).")
     # If len(train_loader) == 0, the 'break' earlier handles it.
 
     # Validation step (optional, can be done less frequently)
-    if (epoch + 1) % 5 == 0 and len(val_loader) > 0: # Validate every 5 epochs, changed from validation_dataset
+    if (epoch + 1) % 5 == 0 and len(val_loader) > 0:
         model.eval()
         val_correct = 0
         val_total_samples = 0
         val_f1_scores = []
         val_mcc_scores = []
         with torch.no_grad():
-            for val_sample in val_loader: # Changed from validation_dataset to val_loader
+            for val_sample in val_loader:
                 X_val = val_sample['X'].to(device)
                 A_val = val_sample['A'].to(device)
                 C_val = val_sample['Y'].long().to(device)
                 
-                out_val_logits = model(X_val, A_val) # Shape: (Batch, Num_Nodes, Num_Classes)
-                val_preds = out_val_logits.argmax(dim=2) # Shape: (Batch, Num_Nodes)
+                with autocast(enabled=use_amp_flag):
+                    out_val_logits = model(X_val, A_val)
+                val_preds = out_val_logits.argmax(dim=2)
                 
                 val_correct += (val_preds == C_val).sum().item()
-                val_total_samples += C_val.numel() # Total node-level samples
-                # For f1_score and mcc_score, flatten the predictions and labels if they are multi-node per batch item
+                val_total_samples += C_val.numel()
                 val_f1_scores.append(f1_score(C_val.cpu().numpy().flatten(), val_preds.cpu().numpy().flatten(), zero_division=0))
                 val_mcc_scores.append(matthews_corrcoef(C_val.cpu().numpy().flatten(), val_preds.cpu().numpy().flatten()))
         
@@ -609,22 +713,23 @@ test_total_samples = 0
 test_f1_scores = []
 test_mcc_scores = []
 
-if len(test_loader) == 0: # Changed from test_dataset to test_loader
+if len(test_loader) == 0:
     print("Test loader is empty. Skipping testing.")
     if len(test_dataset) == 0:
         print("Underlying test dataset is also empty.")
 else:
     with torch.no_grad():
-        for test_sample in test_loader: # Changed from test_dataset to test_loader
+        for test_sample in test_loader:
             X_test = test_sample['X'].to(device)
             A_test = test_sample['A'].to(device)
             C_test = test_sample['Y'].long().to(device)
             
-            out_test_logits = model(X_test, A_test) # Shape: (Batch, Num_Nodes, Num_Classes)
-            test_preds = out_test_logits.argmax(dim=2) # Shape: (Batch, Num_Nodes)
+            with autocast(enabled=use_amp_flag):
+                out_test_logits = model(X_test, A_test)
+            test_preds = out_test_logits.argmax(dim=2)
             
             test_correct += (test_preds == C_test).sum().item()
-            test_total_samples += C_test.numel() # Total node-level samples
+            test_total_samples += C_test.numel()
             test_f1_scores.append(f1_score(C_test.cpu().numpy().flatten(), test_preds.cpu().numpy().flatten(), zero_division=0))
             test_mcc_scores.append(matthews_corrcoef(C_test.cpu().numpy().flatten(), test_preds.cpu().numpy().flatten()))
 

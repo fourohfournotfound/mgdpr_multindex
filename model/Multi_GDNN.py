@@ -5,106 +5,117 @@ import torch.nn.functional as F # Added for potential use, though not in current
 class MultiReDiffusion(torch.nn.Module):
     def __init__(self, input_dim, output_dim, num_relation):
         super(MultiReDiffusion, self).__init__()
-        self.output = output_dim
-        self.fc_layers = nn.ModuleList([nn.Linear(input_dim, output_dim) for _ in range(num_relation)])
+        self.input_dim = input_dim  # Store input_dim for FC vectorization
+        self.output_dim = output_dim  # Store output_dim, was self.output
+        self.num_relation = num_relation
+        
+        self.fc_layers_list = nn.ModuleList([nn.Linear(input_dim, output_dim) for _ in range(num_relation)])
+        
         self.update_layer = torch.nn.Conv2d(num_relation, num_relation, kernel_size=1)
         self.activation1 = torch.nn.PReLU()
         self.activation0 = torch.nn.PReLU()
-        self.num_relation = num_relation
 
     def forward(self, theta_param, t_param, a_input_batched, x_input_batched):
-        # theta_param: (Num_Relations, Expansion_Steps) - Parameters, not batched
-        # t_param: (Num_Relations, Expansion_Steps, Num_Nodes, Num_Nodes) - Parameters, not batched
-        # a_input_batched: (Batch_Size, Num_Relations, Num_Nodes, Num_Nodes) - Batched input adjacencies
-        # x_input_batched: (Batch_Size, Num_Relations, Num_Nodes, Features_Input_Dim) - Batched input features
+        # theta_param: (Num_Relations, Expansion_Steps)
+        # t_param: (Num_Relations, Expansion_Steps, Num_Nodes, Num_Nodes)
+        # a_input_batched: (Batch_Size, Num_Relations, Num_Nodes, Num_Nodes)
+        # x_input_batched: (Batch_Size, Num_Relations, Num_Nodes, Features_Input_Dim)
 
         device = x_input_batched.device
         batch_size = x_input_batched.shape[0]
-        num_relations = theta_param.shape[0] # self.num_relation
         num_nodes = x_input_batched.shape[2]
-        # self.output is the output feature dimension of self.fc_layers
+        # self.num_relation is num_relations
+        # self.input_dim is Features_Input_Dim
+        # self.output_dim is Features_Output_FC
 
-        # Initialize diffusions tensor to store results for each batch item, relation, and node
-        # Shape: (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
-        diffusions_batch = torch.zeros(batch_size, num_relations, num_nodes, self.output, device=device)
+        # 1. Calculate diffusion_mats_batched
+        # theta_param: (R, E) -> reshape to (1, R, E, 1, 1) for broadcasting
+        theta_p_exp = theta_param.unsqueeze(0).unsqueeze(3).unsqueeze(4)
+        # t_param: (R, E, N, N) -> reshape to (1, R, E, N, N) for broadcasting
+        t_p_exp = t_param.unsqueeze(0)
+        # a_input_batched: (B, R, N, N) -> reshape to (B, R, 1, N, N) for broadcasting
+        a_in_b_exp = a_input_batched.unsqueeze(2)
 
-        for b_idx in range(batch_size):
-            # Get data for the current batch item
-            # These are now unbatched for the inner loops:
-            # a_sample: (Num_Relations, Num_Nodes, Num_Nodes)
-            # x_sample: (Num_Relations, Num_Nodes, Features_Input_Dim)
-            a_sample = a_input_batched[b_idx]
-            x_sample = x_input_batched[b_idx]
-
-            for rel_idx in range(num_relations):
-                # current_a_rel_slice: (Num_Nodes, Num_Nodes)
-                current_a_rel_slice = a_sample[rel_idx]
-                # current_x_rel_slice: (Num_Nodes, Features_Input_Dim)
-                current_x_rel_slice = x_sample[rel_idx]
-                
-                diffusion_mat = torch.zeros_like(current_a_rel_slice, device=device)
-                for step_idx in range(theta_param.shape[1]): # expansion_steps
-                    # t_param[rel_idx, step_idx] is (Num_Nodes, Num_Nodes)
-                    diffusion_mat += theta_param[rel_idx, step_idx] * t_param[rel_idx, step_idx] * current_a_rel_slice
-                
-                # diffusion_feat: (Num_Nodes, Features_Input_Dim)
-                diffusion_feat = torch.matmul(diffusion_mat, current_x_rel_slice)
-                
-                # fc_output: (Num_Nodes, Features_Output_FC)
-                fc_output = self.fc_layers[rel_idx](diffusion_feat)
-                
-                # Store in the correct slice of the batched diffusions tensor
-                diffusions_batch[b_idx, rel_idx] = self.activation0(fc_output)
-
-        # diffusions_batch is now (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
-        # This shape is suitable for self.update_layer (Conv2d)
-        # Conv2d expects (Batch, Channels_in, H, W)
-        # Here, Batch_Size, Num_Relations (as Channels_in), Num_Nodes (as H), Features_Output_FC (as W)
+        # Element-wise product for terms to be summed over Expansion_Steps (dim=2)
+        # theta_p_exp: (1, R, E, 1, 1)
+        # t_p_exp:     (1, R, E, N, N)
+        # a_in_b_exp:  (B, R, 1, N, N)
+        # Resulting terms shape: (B, R, E, N, N) due to broadcasting
+        terms = theta_p_exp * t_p_exp * a_in_b_exp
         
-        # The original code used diffusions.unsqueeze(0) because it assumed diffusions was (R,N,F_out)
-        # Now diffusions_batch is already (B,R,N,F_out), so no unsqueeze is needed.
-        # Conv2d expects (batch_size, in_channels, height, width)
-        # Here, in_channels = num_relation, height = num_nodes, width = output_dim (if output_dim is treated as width)
-        # This might need adjustment based on how num_nodes and output_dim are intended as spatial dimensions.
-        # Assuming diffusions is (num_relation, num_nodes, features_out)
-        # To make it (batch_size=1, num_relation_channels, num_nodes_H, features_out_W)
-        # This part seems to assume diffusions is (num_relations, num_nodes, output_dim)
-        # and update_layer treats num_relations as channels.
-        # If diffusions is (num_relations, num_nodes, output_dim_per_relation)
-        # Conv2d expects (N, C_in, H, W). Here, N=1, C_in=num_relation.
-        # The input to Conv2d should be (1, num_relation, num_nodes, self.output)
-        # So, diffusions needs to be permuted if num_nodes is H and self.output is W.
-        # Or, if self.output is not a spatial dimension, Conv1d might be more appropriate.
-        # Given Conv2d(num_relation, num_relation, kernel_size=1), it implies operating on each (node, feature_dim) pair independently across relations.
-        # Let's assume diffusions is (num_relation, num_nodes, self.output)
-        # Permute to (num_nodes, self.output, num_relation) then view as (1, num_relation, num_nodes, self.output) for conv2d
-        # Or more directly: diffusions.unsqueeze(0) if diffusions is (C_in, H, W)
-        # If diffusions is (num_relations, num_nodes, output_dim), then diffusions.unsqueeze(0) is (1, num_relations, num_nodes, output_dim)
-        # This matches the expectation of Conv2d if num_nodes is H and output_dim is W.
+        # Sum over Expansion_Steps dimension
+        # diffusion_mats_batched: (B, R, N, N)
+        diffusion_mats_batched = torch.sum(terms, dim=2)
+
+        # 2. Calculate diffusion_feats_batched
+        # diffusion_mats_batched: (B, R, N, N)
+        # x_input_batched: (B, R, N, F_in) where F_in is self.input_dim
+        # torch.matmul will batch over B and R dimensions: (N,N) @ (N,F_in) -> (N,F_in)
+        # diffusion_feats_batched: (B, R, N, F_in)
+        diffusion_feats_batched = torch.matmul(diffusion_mats_batched, x_input_batched)
+
+        # 3. Apply FC layers (self.fc_layers_list) and activation0, vectorized over relations
+        # diffusion_feats_batched: (B, R, N, F_in)
         
-        # The paper mentions Conv2d_1x1(Delta(S_lr H_l-1 W_l^r)). Delta stacks relational node representations.
-        # So, diffusions is likely (num_relation, num_nodes, output_dim_of_fc_layers)
-        # update_layer is Conv2d(num_relation, num_relation, kernel_size=1)
-        # Input to conv2d should be (Batch, Channels_in, H, W)
-        # Here, Batch=1 (implicitly), Channels_in = num_relation. H=num_nodes, W=output_dim
-        # So, diffusions.unsqueeze(0) is (1, num_relation, num_nodes, self.output) - this seems correct.
+        # Stack weights and biases from self.fc_layers_list
+        # all_fc_weights: (R, F_out, F_in)
+        all_fc_weights = torch.stack([layer.weight for layer in self.fc_layers_list], dim=0)
+        # all_fc_biases: (R, F_out)
+        all_fc_biases = torch.stack([layer.bias for layer in self.fc_layers_list], dim=0)
+
+        # Prepare input for batched matrix multiplication (bmm)
+        # Input: diffusion_feats_batched (B, R, N, F_in)
+        # Permute to (R, B, N, F_in)
+        input_permuted_for_fc = diffusion_feats_batched.permute(1, 0, 2, 3)
+        # Reshape to (R, B*N, F_in) to treat R as batch for bmm
+        input_reshaped_for_fc = input_permuted_for_fc.contiguous().view(
+            self.num_relation,
+            batch_size * num_nodes,
+            self.input_dim
+        )
+
+        # Prepare weights for bmm
+        # all_fc_weights is (R, F_out, F_in). Transpose to (R, F_in, F_out) for matmul.
+        weights_for_bmm = all_fc_weights.transpose(1, 2)
+        
+        # Apply linear transformation using bmm
+        # input_reshaped_for_fc: (R, B*N, F_in)
+        # weights_for_bmm:       (R, F_in, F_out)
+        # fc_applied_bmm:        (R, B*N, F_out)
+        fc_applied_bmm = torch.bmm(input_reshaped_for_fc, weights_for_bmm)
+        
+        # Add biases
+        # all_fc_biases: (R, F_out) -> expand to (R, 1, F_out) for broadcasting
+        bias_expanded_for_fc = all_fc_biases.unsqueeze(1)
+        # fc_with_bias_bmm: (R, B*N, F_out)
+        fc_with_bias_bmm = fc_applied_bmm + bias_expanded_for_fc
+        
+        # Reshape back to (B, R, N, F_out)
+        # (R, B*N, F_out) -> (R, B, N, F_out)
+        fc_outputs_reshaped = fc_with_bias_bmm.view(
+            self.num_relation,
+            batch_size,
+            num_nodes,
+            self.output_dim # F_out
+        )
+        # (R, B, N, F_out) -> (B, R, N, F_out)
+        fc_outputs_batched = fc_outputs_reshaped.permute(1, 0, 2, 3)
+
+        # Apply activation0
+        # diffusions_batch: (B, R, N, F_out)
+        diffusions_batch = self.activation0(fc_outputs_batched)
+        
+        # 4. Apply update_layer and activation1
+        # diffusions_batch shape: (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
+        # This is the expected input shape for self.update_layer (Conv2d)
+        # Input: (Batch_Size, Channels_in=Num_Relations, H=Num_Nodes, W=Features_Output_FC)
         latent_feat_batch = self.activation1(self.update_layer(diffusions_batch))
         # latent_feat_batch shape: (Batch_Size, Num_Relations_out, Num_Nodes, Features_Output_FC)
         # Since self.update_layer is Conv2d(num_relation, num_relation, ...), Num_Relations_out = Num_Relations.
-        # So, latent_feat_batch is (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
 
-        # The MGDPR layer expects two outputs from diffusion_layers:
-        # h_diffused (which becomes the new h for next diffusion) and u_intermediate (input to retention)
-        # Both should have the same shape: (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
-        # In the original paper/notebook, h_diffused and u_intermediate are often the same tensor or derived closely.
-        # Here, latent_feat_batch is the result after the Conv2d update, and diffusions_batch is before it.
-        # Let's return latent_feat_batch as the primary "diffused" representation,
-        # and diffusions_batch as the intermediate one if needed (though often they are the same or u is latent_feat).
-        # The MGDPR model uses the second output (u_intermediate) as input to ParallelRetention.
-        # The first output (h_diffused) becomes the new `h` for the next MGDPR layer's diffusion part.
-        # It's common for u_intermediate to be the same as h_diffused.
-        # Let's assume latent_feat_batch is the refined representation to be used for both purposes.
-        return latent_feat_batch, latent_feat_batch # Return (h_diffused, u_intermediate)
+        # Return (h_diffused, u_intermediate)
+        # As per original logic, both can be latent_feat_batch
+        return latent_feat_batch, latent_feat_batch
 
 
 class ParallelRetention(torch.nn.Module):

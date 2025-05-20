@@ -261,60 +261,37 @@ class MyDataset(Dataset):
              print(f"Warning: Actual length {self._actual_len} is less than theoretical max {theoretical_max_graphs} for {self.graph_directory_path}. "
                    f"Some graph windows might have been skipped during generation due to data issues.")
 
-        # Pre-load all graph data into memory to optimize __getitem__
-        self.loaded_graphs = []
+        # Graph data will be loaded lazily in __getitem__.
+        # self._actual_len (calculated above) represents the number of graph files expected to be available.
         if self._actual_len > 0:
-            print(f"Pre-loading {self._actual_len} graph files into memory...")
-            for i in tqdm(range(self._actual_len), desc="Loading graphs into memory"):
-                data_path = os.path.join(self.graph_directory_path, f'graph_{i}.pt')
-                try:
-                    if os.path.exists(data_path):
-                        self.loaded_graphs.append(torch.load(data_path))
-                    else:
-                        # This should not happen if _actual_len was calculated correctly based on existing files.
-                        print(f"ERROR: During pre-loading, file {data_path} for graph_{i} not found, though it was expected based on _actual_len. Stopping pre-load.")
-                        # Optionally, truncate _actual_len here or raise an error.
-                        # For now, we'll have fewer items in loaded_graphs than _actual_len might suggest.
-                        # This will cause an IndexError later if __getitem__ tries to access beyond the truly loaded items.
-                        # A more robust approach might be to re-set _actual_len to len(self.loaded_graphs) here.
-                        break
-                except Exception as e:
-                    print(f"ERROR: Failed to pre-load graph_{i} from {data_path}: {e}")
-                    # Decide how to handle: skip this graph, stop loading, or raise.
-                    # For now, we'll skip and it might lead to a mismatch if not handled.
-                    # Consider adding a placeholder or re-evaluating _actual_len.
-                    # If a file is corrupted, self.loaded_graphs will be shorter.
-                    break # Stop loading if one file fails
-            
-            # If loading stopped prematurely, _actual_len might be greater than len(self.loaded_graphs)
-            if len(self.loaded_graphs) != self._actual_len:
-                print(f"Warning: Pre-loading completed, but only {len(self.loaded_graphs)} graphs were loaded into memory, while _actual_len was {self._actual_len}. "
-                      f"This might be due to missing files or loading errors. Effective dataset size will be {len(self.loaded_graphs)}.")
-                self._actual_len = len(self.loaded_graphs) # Adjust actual length to what was successfully loaded
-
-            if self._actual_len > 0:
-                 print(f"Successfully pre-loaded {self._actual_len} graph files into memory.")
-            elif theoretical_max_graphs > 0 : # _actual_len became 0 after failed preloading
-                 print(f"Warning: Failed to pre-load any graph files into memory, though {theoretical_max_graphs} were expected.")
+            print(f"{self._actual_len} graph files are expected to be available for lazy loading.")
+        elif theoretical_max_graphs > 0:
+             print(f"Warning: No graph files seem to be available (_actual_len is 0), though {theoretical_max_graphs} were theoretically possible.")
 
 
     def __len__(self):
-        return self._actual_len # This now reflects successfully pre-loaded graphs
+        return self._actual_len # This reflects the number of graph files found during initialization.
 
     def __getitem__(self, idx: int):
-        if idx < 0 or idx >= self._actual_len: # _actual_len is now based on successfully loaded graphs
-            raise IndexError(f"Index {idx} out of range for dataset of length {self._actual_len} (number of pre-loaded graphs)")
+        if idx < 0 or idx >= self._actual_len:
+            raise IndexError(f"Index {idx} out of range for dataset of length {self._actual_len}")
         
-        # Return data from the pre-loaded list
-        # No need to check file existence here as it was done during pre-loading
+        data_path = os.path.join(self.graph_directory_path, f'graph_{idx}.pt')
+        
         try:
-            return self.loaded_graphs[idx]
-        except IndexError:
-            # This might happen if _actual_len was not correctly updated after a partial pre-load
-            # and idx is within the original _actual_len but outside the bounds of the actually loaded_graphs.
-            # The check `idx >= self._actual_len` at the start should prevent this if _actual_len is accurate.
-            print(f"Internal ERROR MyDataset.__getitem__({idx}): Index is within _actual_len ({self._actual_len}) but out of bounds for self.loaded_graphs (len: {len(self.loaded_graphs)}). This indicates an issue with pre-loading logic or _actual_len synchronization.")
-            raise # Re-raise the original IndexError or a custom one.
+            # Load the graph tensor on demand
+            graph_data = torch.load(data_path)
+            return graph_data
+        except FileNotFoundError:
+            # This should ideally not happen if _actual_len was determined correctly
+            # and no files were deleted post-initialization.
+            print(f"ERROR MyDataset.__getitem__({idx}): File not found at {data_path}. This might indicate an issue with graph file availability or _actual_len calculation.")
+            raise # Re-raise FileNotFoundError or a custom error
+        except Exception as e:
+            print(f"ERROR MyDataset.__getitem__({idx}): Failed to load graph from {data_path}: {e}")
+            # Depending on desired robustness, could return None, skip, or raise.
+            # Raising an error is generally safer to signal a problem.
+            raise
 
 
     def check_years(self, date_str: str, start_str: str, end_str: str) -> bool:
