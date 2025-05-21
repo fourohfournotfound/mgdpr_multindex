@@ -1,0 +1,26 @@
+# Python bytecode
+*.pyc
+__pycache__/
+
+# Editor/OS temporary files
+*~
+*.tmp
+.DS_Store
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Pytest cache
+.pytest_cache/
+
+# Logs
+*.log
+
+# Data files (if generated or too large)
+*.csv
+*.pkl
+*.zip
+
+# Model files
+*.pth
+*.pt
