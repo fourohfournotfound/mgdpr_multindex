@@ -69,7 +69,7 @@ com_list_csv_paths = [
 # Root directory for individual stock data CSVs (e.g., market_ticker_30Y.csv)
 # MyDataset expects files like: os.path.join(root_data_dir, f'{market}_{ticker}_30Y.csv')
 # TODO: Update this path to your local raw stock data CSV file
-root_data_dir = "/workspaces/ai_testground/shortlist_stocks-1.csv" # Path to the single stock data CSV file
+root_data_dir = "/workspaces/ai_testground/05_06_25_sectoretf_filtered_and_aligned.csv" # Path to the single stock data CSV file
 
 # Destination directory for generated graph .pt files
 # MyDataset will create subfolders like: os.path.join(graph_dest_dir, f'{market}_{type}_{start}_{end}_{window}')
@@ -260,9 +260,11 @@ if num_companies == 0:
 # The actual feature length from X is window_size.
 # The '+1' for label was handled in MyDataset; X_processed has window_size time steps.
 model_feature_len = window_size # This is the actual length of the feature vector per node/relation from X
-d_layers, num_relation, m_gamma, diffusion_steps = 6, 5, 2.5e-4, 7
+# d_layers, num_relation, m_gamma, diffusion_steps = 6, 5, 2.5e-4, 7 # Old line
+d_layers, num_relation, regularization_gamma, diffusion_steps = 2, 5, 2.5e-4, 7 # Renamed m_gamma, REDUCED d_layers to 2
+retention_decay_zeta = 0.9 # Added as per troubleshooting.md
 
-# Note: `gamma` in notebook was 2.5e-4, renamed to m_gamma.
+# Note: `gamma` in notebook was 2.5e-4, renamed to regularization_gamma.
 # The MGDPR model's `time_dim` parameter (for D_gamma, ParallelRetention) should be model_feature_len.
 
 # diffusion_config: input to first MultiReDiffusion is model_feature_len
@@ -416,7 +418,7 @@ for l_idx in range(d_layers):
 
 
 model = MGDPR(actual_diffusion_config, retention_config, ret_linear_1_config, ret_linear_2_config, mlp_config,
-              d_layers, num_companies, model_feature_len, num_relation, m_gamma, diffusion_steps)
+              d_layers, num_companies, model_feature_len, num_relation, retention_decay_zeta, diffusion_steps, regularization_gamma_param=regularization_gamma) # Pass retention_decay_zeta and optional regularization_gamma
 model = model.to(device)
 
 # --- Optimizer and Objective Function ---
@@ -425,7 +427,7 @@ def theta_regularizer(theta_param): # Renamed to avoid conflict
     ones = torch.ones_like(row_sums)
     return torch.sum(torch.abs(row_sums - ones))
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=2.5e-4) # Reverted to paper's learning rate
 criterion = F.cross_entropy # Using criterion directly
 
 # --- Training, Validation, and Testing ---
@@ -471,7 +473,18 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
         # So, (32, 2, 9)
         out_logits_permuted = out_logits.permute(0, 2, 1) # (Batch_Size, Num_Classes, Num_Nodes)
         
-        loss = criterion(out_logits_permuted, C_labels)
+        ce_loss = criterion(out_logits_permuted, C_labels)
+        
+        # Add theta regularizer from the paper
+        # The paper sums this directly, implying a weight of 1.0 for the regularization term.
+        # model.theta is (layers, num_relation, expansion_steps)
+        # theta_regularizer expects a single theta_param (num_relation, expansion_steps)
+        # We need to sum the regularization loss over all layers.
+        reg_loss = 0
+        for l_idx in range(model.layers): # model.layers was d_layers in train script
+            reg_loss += theta_regularizer(model.theta[l_idx])
+        
+        loss = ce_loss + reg_loss # Add regularization to the loss
     
     # Backward pass and optimization
     if use_amp:
@@ -482,22 +495,25 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
                 scaler.update()
         else:
             scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Added Gradient Clipping
             scaler.step(optimizer)
             scaler.update()
     else:
         if is_profiling:
             with record_function("model_backward_no_amp"):
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Added Gradient Clipping
                 optimizer.step()
         else:
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Added Gradient Clipping
             optimizer.step()
     
     # profiler.step() is now handled by the schedule, so no manual call here.
 
     return loss, out_logits, C_labels
 
-epochs = 2 # Reduced for quick testing, notebook uses 10000
+epochs = 8 # Reduced for quick testing, notebook uses 10000
 model.reset_parameters()
 
 # --- AMP Scaler ---

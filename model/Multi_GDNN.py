@@ -239,13 +239,46 @@ class ParallelRetention(torch.nn.Module):
 
 class MGDPR(nn.Module):
     def __init__(self, diffusion_config, retention_config, ret_linear_1_config, ret_linear_2_config, post_pro_config,
-                 layers, num_nodes, time_dim, num_relation, gamma, expansion_steps):
+                 layers, num_nodes, time_dim, num_relation, retention_decay_zeta, expansion_steps, regularization_gamma_param=None): # Changed gamma to retention_decay_zeta, added optional regularization_gamma_param
         super(MGDPR, self).__init__()
 
         self.layers = layers
         self.num_nodes = num_nodes
         self.time_dim = time_dim # This is time_steps (window size)
         self.num_relation = num_relation
+        self.regularization_gamma = regularization_gamma_param # Store for potential future use if needed for theta_regularizer
+
+        # Determine feature dimensions for LayerNorm
+        eta_feature_dims = []
+        for i in range(layers):
+            # Output feature dimension of ParallelRetention's ret_feat layer (retention_config[3*i+2])
+            # is then spread across num_nodes.
+            # The effective feature dimension per node for eta_batch is (time_dim * retention_out_dim_of_PR_block) / num_nodes
+            # This matches the logic in train_val_test.py for eta_feature_dims_per_node
+            pr_out_dim = retention_config[3 * i + 2]
+            eta_feat_dim = (self.time_dim * pr_out_dim) // self.num_nodes # Ensure integer
+            if (self.time_dim * pr_out_dim) % self.num_nodes != 0:
+                 print(f"Warning: MGDPR LayerNorm for eta_batch layer {i}, (time_dim * pr_out_dim) is not divisible by num_nodes. "
+                       f"({self.time_dim} * {pr_out_dim}) / {self.num_nodes} = { (self.time_dim * pr_out_dim) / self.num_nodes}. Using floor division.")
+            eta_feature_dims.append(eta_feat_dim)
+
+        self.ln_eta = nn.ModuleList([nn.LayerNorm(eta_feature_dims[i]) for i in range(layers)])
+        
+        # ret_linear_1_config is [in0, out0, in1, out1, ...]
+        # Feature dimension after ret_linear_1[l] is ret_linear_1_config[2*l+1]
+        self.ln_skip = nn.ModuleList([nn.LayerNorm(ret_linear_1_config[2*i+1]) for i in range(layers)])
+
+        # ret_linear_2_config is [in0, out0, in1, out1, ...]
+        # Feature dimension after ret_linear_2[l] is ret_linear_2_config[2*l+1]
+        self.ln_retained = nn.ModuleList([nn.LayerNorm(ret_linear_2_config[2*i+1]) for i in range(layers)])
+
+        # For MLP, post_pro_config is [in, hidden1, hidden2, ..., out_classes]
+        # We add LayerNorm after each hidden layer's Linear transformation, before activation.
+        # So, for post_pro_config[i+1] where it's a hidden dim.
+        self.ln_mlp = nn.ModuleList()
+        for i in range(len(post_pro_config) - 2): # -2 because we don't normalize before the final output layer or after it
+            self.ln_mlp.append(nn.LayerNorm(post_pro_config[i+1]))
+
 
         self.T = nn.Parameter(torch.empty(layers, num_relation, expansion_steps, num_nodes, num_nodes))
         nn.init.xavier_uniform_(self.T)
@@ -254,36 +287,12 @@ class MGDPR(nn.Module):
         nn.init.xavier_uniform_(self.theta)
 
         lower_tri = torch.tril(torch.ones(time_dim, time_dim), diagonal=-1)
-        # D_gamma_tensor = torch.where(lower_tri == 0, torch.tensor(0.0), gamma ** -lower_tri) # Original
-        # Paper uses zeta for decay in retention, gamma for diffusion constraint.
-        # The D_gamma in notebook is based on `gamma` param to MGDPR.
-        # Let's assume gamma is the decay coefficient for retention here as per notebook.
-        # The paper's D_ij = zeta^(i-j). Here it's gamma^(-lower_tri_value).
-        # If lower_tri_value is (i-j) for i>j, then gamma^-(i-j).
-        # This seems consistent if gamma is zeta.
         D_gamma_tensor = torch.zeros_like(lower_tri)
         non_zero_mask = lower_tri != 0
-        # Ensure gamma is positive if it's a base for exponentiation
-        # Using abs(gamma) or ensuring gamma > 0 during init might be safer if gamma can be negative.
-        # However, decay factors are usually > 0.
-        # The paper uses zeta, typically > 1 for decay. If gamma is small (e.g., 2.5e-4), gamma^-(i-j) will be very large.
-        # If gamma is the decay factor itself (e.g. 0.9), then gamma^(i-j).
-        # The notebook has `gamma ** -lower_tri`. If lower_tri is 1, 2, 3... for i-j.
-        # Then gamma^-1, gamma^-2, ...
-        # If gamma = 2.5e-4, then (1/gamma)^1, (1/gamma)^2 ... these are large.
-        # If gamma is decay like 0.9, then 0.9^-1, 0.9^-2... also large.
-        # The paper's D_ij = zeta^(i-j) where zeta is decay. If zeta < 1, it decays.
-        # If D_gamma is for (QK^T . D)V, D should be decaying.
-        # RetNet paper: D_nm = gamma^(n-m) for n>=m. gamma is a scalar between 0 and 1.
-        # So, if `lower_tri` gives `n-m` for `n>m`, then `gamma_decay^(n-m)`.
-        # The `gamma` parameter to MGDPR (2.5e-4) is likely the learning rate or regularization, not retention decay.
-        # The paper mentions zeta as decay coefficient for retention. This is not in MGDPR params.
-        # Let's assume the notebook's D_gamma calculation is what's intended, using the MGDPR `gamma` parameter.
-        # This might be an area for review based on RetNet principles if `gamma` is not the retention decay.
-        # For now, replicate notebook.
-        D_gamma_tensor[non_zero_mask] = gamma ** (-lower_tri[non_zero_mask])
+        # Corrected D_gamma calculation using retention_decay_zeta (e.g., 0.9)
+        # D_nm = zeta^(n-m) for n>m. lower_tri[non_zero_mask] gives positive values for (n-m).
+        D_gamma_tensor[non_zero_mask] = retention_decay_zeta ** (lower_tri[non_zero_mask])
         self.register_buffer('D_gamma', D_gamma_tensor)
-
 
         self.diffusion_layers = nn.ModuleList(
             # diffusion_config is [in0, out0, in1, out1, ...]
@@ -321,6 +330,12 @@ class MGDPR(nn.Module):
         )
         self.activation_mlp = nn.PReLU() # Assuming PReLU based on other activations, or could be configurable
 
+        # For bypass test (now removed from forward, but keep layers if needed for other tests):
+        # initial_features_per_node_flat = self.num_relation * self.time_dim # R * F_initial
+        # mlp_input_dim = post_pro_config[0]
+        # self.bypass_projection = nn.Linear(initial_features_per_node_flat, mlp_input_dim)
+        # self.ln_bypass_projection = nn.LayerNorm(mlp_input_dim)
+
     def forward(self, x_batch, a_batch):
         # x_batch: (Batch_Size, Num_Relations, Num_Nodes, Features_Initial)
         # a_batch: (Batch_Size, Num_Relations, Num_Nodes, Num_Nodes)
@@ -330,18 +345,19 @@ class MGDPR(nn.Module):
 
         # h_for_diffusion is the input to the diffusion part of each MGDPR layer.
         # Initialized with x_batch. Shape: (B, R, N, F_in)
-        h_for_diffusion = x_batch.to(device)
+        h_for_diffusion = x_batch.to(device) # Original path
         
         # h_prime_retained_for_skip is the output of the retention block (after ret_linear_2) from the *previous* MGDPR layer.
         # This is used for the skip connection in the current MGDPR layer's retention block.
         # Initialized to None, special handling for l_layer_idx == 0.
         # Shape: (B, N, F_from_prev_rl2)
-        h_prime_retained_for_skip = None
+        h_prime_retained_for_skip = None # Original path
 
         # This will store the final output of the retention block for the current layer, to be used by MLP.
         # Shape: (B, N, F_mlp_in_features)
-        final_layer_output_for_mlp = None
+        final_layer_output_for_mlp = None # Original path
 
+        # --- ORIGINAL MGDPR PATH (Restored) ---
         for l_layer_idx in range(self.layers):
             # --- Multi-relational Graph Diffusion ---
             # Input h_for_diffusion: (B, R, N, F_current_diffusion_input)
@@ -362,7 +378,7 @@ class MGDPR(nn.Module):
             # Input self.D_gamma: (Time_Dim_Ret, Time_Dim_Ret) - not batched, handled by ParallelRetention
             # Output eta_batch: (B, N, F_retention_output)
             eta_batch = self.retention_layers[l_layer_idx](u_intermediate, self.D_gamma)
-            eta_batch = eta_batch.to(device)
+            eta_batch = self.ln_eta[l_layer_idx](eta_batch.to(device))
 
             # --- Decoupled Representation Transform (Skip Connections) ---
             if l_layer_idx == 0:
@@ -381,12 +397,14 @@ class MGDPR(nn.Module):
             
             # transformed_skip: (B, N, F_rl1_output)
             transformed_skip = self.ret_linear_1[l_layer_idx](skip_connection_source)
+            transformed_skip = self.ln_skip[l_layer_idx](transformed_skip)
             
             # h_concat: (B, N, F_eta + F_rl1_output)
             h_concat = torch.cat((eta_batch, transformed_skip), dim=2) # Concatenate along the feature dimension
             
             # current_h_prime_retained: (B, N, F_rl2_output)
             current_h_prime_retained = self.ret_linear_2[l_layer_idx](h_concat)
+            current_h_prime_retained = self.ln_retained[l_layer_idx](current_h_prime_retained)
             
             # This output becomes the skip connection source for the next layer.
             h_prime_retained_for_skip = current_h_prime_retained
@@ -400,18 +418,31 @@ class MGDPR(nn.Module):
         if final_layer_output_for_mlp is None:
              # This case should ideally not happen if self.layers > 0
             if self.layers == 0: # If no MGDPR layers, MLP processes initial x transformed.
+                 # This path should not be taken if self.layers > 0 (e.g. 2 as per train script)
+                 # If self.layers was 0, this would be the path.
                 if x_batch.dim() == 4:
-                    current_rep_for_mlp = x_batch.permute(0, 2, 1, 3).contiguous().view(batch_size, self.num_nodes, -1)
-                else: # Should not happen with current DataLoader
+                    # Fallback for layers=0: use initial x_batch, reshaped and projected
+                    x_transformed_for_mlp = x_batch.permute(0, 2, 1, 3).contiguous().view(batch_size, self.num_nodes, -1)
+                    # We need a projection if MLP input dim doesn't match num_relation * time_dim
+                    # For simplicity, assume post_pro_config[0] is designed for this or add a specific projection.
+                    # For now, let's assume if layers=0, the MLP input is directly from reshaped x_batch if dimensions match,
+                    # or this path needs a dedicated projection layer.
+                    # The bypass_projection was for this, but it's better to handle it cleanly.
+                    # For now, this path will likely error if layers=0 and MLP input dim doesn't match.
+                    # The current train script has layers=2, so this path shouldn't be hit.
+                    current_rep_for_mlp = x_transformed_for_mlp # This might need projection
+                else:
                     raise ValueError("x_batch has unexpected shape for MLP input when layers=0")
-            else: # Should not be reached if loop ran
-                raise ValueError("final_layer_output_for_mlp is None after MGDPR layers.")
+            else: # Should not be reached if loop ran and self.layers > 0
+                raise ValueError("final_layer_output_for_mlp is None after MGDPR layers, but self.layers > 0.")
         else:
             current_rep_for_mlp = final_layer_output_for_mlp
+        # --- END ORIGINAL MGDPR PATH ---
 
         for i, mlp_layer in enumerate(self.mlp):
             current_rep_for_mlp = mlp_layer(current_rep_for_mlp)
-            if i < len(self.mlp) - 1: # Apply activation to all but the last MLP layer
+            if i < len(self.mlp) - 1: # Apply LayerNorm and activation to all but the last MLP layer
+                current_rep_for_mlp = self.ln_mlp[i](current_rep_for_mlp)
                 current_rep_for_mlp = self.activation_mlp(current_rep_for_mlp)
         
         # Output: (Batch_Size, Num_Nodes, Num_Classes)
