@@ -127,7 +127,7 @@ class MultiReDiffusion(torch.nn.Module):
 
 
 class ParallelRetention(torch.nn.Module):
-    def __init__(self, time_dim, in_dim, inter_dim, out_dim): # time_dim seems to be num_nodes from usage
+    def __init__(self, time_dim, in_dim, inter_dim, out_dim, num_gn_groups=32): # Added num_gn_groups
         super(ParallelRetention, self).__init__()
         # The paper's Parallel Retention (Eq 4) takes Z (node features over time/relations).
         # Z has dimensions like (num_nodes, feature_dim_from_diffusion) or (time_steps, feature_dim)
@@ -166,6 +166,16 @@ class ParallelRetention(torch.nn.Module):
         self.in_dim = in_dim # This is (num_nodes * features_from_diffusion) / num_relation
         self.inter_dim = inter_dim
         self.out_dim = out_dim
+
+        # Group Normalization
+        if self.inter_dim % num_gn_groups == 0:
+            self.group_norm = nn.GroupNorm(num_gn_groups, self.inter_dim)
+        else:
+            # Fallback to 1 group (similar to LayerNorm over channels) if inter_dim is not divisible
+            # Or if inter_dim is smaller than num_gn_groups
+            print(f"Warning: ParallelRetention inter_dim {self.inter_dim} not divisible by num_gn_groups {num_gn_groups}. Using num_groups=1 for GroupNorm.")
+            self.group_norm = nn.GroupNorm(1, self.inter_dim)
+            
         self.activation = torch.nn.PReLU()
         self.Q_layers = nn.Linear(self.in_dim, self.inter_dim)
         self.K_layers = nn.Linear(self.in_dim, self.inter_dim)
@@ -219,7 +229,14 @@ class ParallelRetention(torch.nn.Module):
 
             retained_x_sample = torch.matmul(current_d_gamma * inter_feat_sample, v_sample) # (time_dim, inter_dim)
             
-            output_x_sample = self.activation(self.ret_feat(retained_x_sample)) # (time_dim, out_dim)
+            # Apply Group Normalization as per paper: phi((QK^T . D)V)
+            # Input to GroupNorm: (N, C, L), C = num_channels = self.inter_dim
+            # retained_x_sample is (time_dim, inter_dim). Transpose to (inter_dim, time_dim) then unsqueeze for batch.
+            retained_x_sample_norm_input = retained_x_sample.transpose(0, 1).unsqueeze(0) # (1, inter_dim, time_dim)
+            normalized_retained_x = self.group_norm(retained_x_sample_norm_input)
+            normalized_retained_x = normalized_retained_x.squeeze(0).transpose(0, 1) # Back to (time_dim, inter_dim)
+
+            output_x_sample = self.activation(self.ret_feat(normalized_retained_x)) # (time_dim, out_dim)
 
             # Reshape to (Num_Nodes, Features_after_Retention)
             # This requires self.time_dim * self.out_dim to be divisible by num_nodes_original.
@@ -310,7 +327,7 @@ class MGDPR(nn.Module):
 
         # retention_config is a flat list: [in0, inter0, out0, in1, inter1, out1, ...]
         self.retention_layers = nn.ModuleList(
-            [ParallelRetention(time_dim, retention_config[3 * i], retention_config[3 * i + 1], retention_config[3 * i + 2])
+            [ParallelRetention(time_dim, retention_config[3 * i], retention_config[3 * i + 1], retention_config[3 * i + 2], num_gn_groups=25) # Changed num_gn_groups to 25
              for i in range(len(retention_config) // 3)]
         )
         

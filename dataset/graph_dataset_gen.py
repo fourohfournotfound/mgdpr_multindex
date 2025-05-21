@@ -61,6 +61,12 @@ def _mp_worker_graph_generation_task(
 
         for k_feature_idx in range(X_processed.shape[0]):
             X_processed[k_feature_idx] = torch.Tensor(np.log1p(X_processed[k_feature_idx].numpy()))
+            # Add Z-score normalization per feature, per company, across the window
+            # X_processed[k_feature_idx] is (num_companies, window_size)
+            mean = X_processed[k_feature_idx].mean(dim=1, keepdim=True)
+            std = X_processed[k_feature_idx].std(dim=1, keepdim=True)
+            # Add a small epsilon to std to prevent division by zero if a feature is constant
+            X_processed[k_feature_idx] = (X_processed[k_feature_idx] - mean) / (std + 1e-9)
 
         A_adj = torch.zeros((X_processed.shape[0], X_processed.shape[1], X_processed.shape[1]))
         for l_feature_idx in range(A_adj.shape[0]):
@@ -386,10 +392,10 @@ class MyDataset(Dataset):
         exp_entropy_diff = torch.exp(entropy_i - entropy_j)
         A_calculated_values = energy_ratio * exp_entropy_diff
         A = torch.where(zero_energy_j_mask.expand_as(A), torch.zeros_like(A), A_calculated_values)
-        condition_A_lt_1_and_gt_0 = (A < 1.0) & (A > 1e-9) 
-        A = torch.where(condition_A_lt_1_and_gt_0, torch.ones_like(A), A)
-        A_final = torch.log(A + 1e-9) 
-        return A_final
+        # condition_A_lt_1_and_gt_0 = (A < 1.0) & (A > 1e-9) # Removed this line
+        # A = torch.where(condition_A_lt_1_and_gt_0, torch.ones_like(A), A) # Removed this line
+        # A_final = torch.log(A + 1e-9) # Removed log transformation for now to align with paper's (a_t,r)_ij
+        return A # Return A directly as per paper's formula for (a_t,r)_ij
 
     def node_feature_matrix(self, window_dates_str: List[str], comlist_arg: List[str], market: str) -> torch.Tensor: # Renamed comlist to comlist_arg
         num_features = 5
