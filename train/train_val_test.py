@@ -11,8 +11,11 @@ import csv
 from datetime import datetime, timedelta # Added import
 import torch.nn.functional as F
 import pandas as pd # Added for MultiIndex DataFrame
+import numpy as np # Added for np.isnan
 # import torch.distributions # Not explicitly used in the notebook's training script part
-from sklearn.metrics import matthews_corrcoef, f1_score
+from sklearn.metrics import matthews_corrcoef, f1_score, ndcg_score
+from scipy.stats import spearmanr
+from sklearn.preprocessing import MinMaxScaler # Added for scaling y_true for NDCG
 from torch.utils.data import DataLoader # Added for DataLoader optimization
 
 from dataset.graph_dataset_gen import MyDataset # Corrected import
@@ -380,7 +383,7 @@ if not ret_linear_2_config: # Handle d_layers = 0 case, though unlikely
 else:
   final_mlp_input_dim = ret_linear_2_config[-1] # Output of the last ret_linear_2 layer
 
-mlp_config = [final_mlp_input_dim, 128, 2] # 2 for binary classification
+mlp_config = [final_mlp_input_dim, 128, 1] # Changed to 1 for continuous score output for ranking
 
 # MGDPR's `time_dim` parameter is used for D_gamma and ParallelRetention's self.time_dim.
 # This should be `model_feature_len` (i.e., `window_size`).
@@ -428,8 +431,49 @@ def theta_regularizer(theta_param): # Renamed to avoid conflict
     return torch.sum(torch.abs(row_sums - ones))
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=2.5e-4) # Reverted to paper's learning rate
-criterion = F.cross_entropy # Using criterion directly
+# criterion = F.cross_entropy # Using criterion directly # Replaced by ListNetLoss
 
+# --- Custom ListNet-style Loss Function ---
+class ListNetLoss(torch.nn.Module):
+    def __init__(self):
+        super(ListNetLoss, self).__init__()
+        # KLDivLoss expects log-probabilities for the input and probabilities for the target.
+        # reduction='batchmean' means the sum of losses for each sample in the batch is divided by batch_size.
+        self.kl_div_loss = torch.nn.KLDivLoss(reduction='batchmean', log_target=False) # log_target=False is default
+
+    def forward(self, y_pred_scores, y_true_scores):
+        """
+        Calculates ListNet loss.
+        Args:
+            y_pred_scores (torch.Tensor): Predicted scores from the model.
+                                          Shape: (Batch_Size, Num_Nodes_in_List)
+            y_true_scores (torch.Tensor): True target scores (e.g., z-scored vol-adjusted returns).
+                                          Shape: (Batch_Size, Num_Nodes_in_List)
+                                          May contain NaNs for items that are not valid targets.
+        Returns:
+            torch.Tensor: The ListNet loss value.
+        """
+        # Handle NaNs in y_true_scores for softmax calculation
+        # Replace NaNs with a very small number so they get near-zero probability
+        y_true_for_softmax = torch.where(torch.isnan(y_true_scores), torch.full_like(y_true_scores, -1e9), y_true_scores)
+        
+        # Create target probabilities P_true
+        # Softmax over the list of items (Num_Nodes_in_List dimension)
+        p_true = F.softmax(y_true_for_softmax, dim=1)
+
+        # Create predicted probabilities P_pred (as log-probabilities for KLDivLoss)
+        # Softmax over the list of items
+        log_p_pred = F.log_softmax(y_pred_scores, dim=1)
+        
+        # KLDivLoss: sum(p_true * (log(p_true) - log_p_pred))
+        # Since log_target=False, it computes sum(p_true * (log(p_true) - log_p_pred)) if p_true is passed.
+        # However, the standard KLDivLoss(log_input, target) is sum(target * (log(target) - log_input)).
+        # We provide log_p_pred as input and p_true as target.
+        loss = self.kl_div_loss(log_p_pred, p_true)
+        
+        return loss
+
+criterion = ListNetLoss()
 # --- Training, Validation, and Testing ---
 # --- Profiler Configuration (from parsed arguments) ---
 PROFILE_ENABLED = args.profile
@@ -452,74 +496,92 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
     Processes a single batch of training data.
     """
     X = batch_sample['X'].to(device)
+    X = batch_sample['X'].to(device)
     A = batch_sample['A'].to(device)
-    C_labels = batch_sample['Y'].long().to(device) # Renamed to avoid conflict with criterion
+    # C_labels are now the true z-scored vol-adjusted returns (continuous)
+    # Shape: (Batch_Size, Num_Nodes)
+    C_target_scores = batch_sample['Y'].float().to(device)
 
-    optimizer.zero_grad(set_to_none=True) # Use set_to_none=True for potential minor perf gain
+    optimizer.zero_grad(set_to_none=True)
     
     # Forward pass
     with torch.amp.autocast('cuda', enabled=use_amp):
         if is_profiling:
-            with record_function("model_forward"): # Use the imported record_function
-                out_logits = model(X, A) # Expected shape: (Batch_Size, Num_Nodes, Num_Classes) e.g. (32, 9, 2)
+            with record_function("model_forward"):
+                # Model output is now (Batch_Size, Num_Nodes, 1)
+                out_predicted_scores_raw = model(X, A)
         else:
-            out_logits = model(X, A)
+            out_predicted_scores_raw = model(X, A)
         
-        # Calculate loss
-        # criterion (F.cross_entropy) expects input (logits) as (N, C, ...) and target (labels) as (N, ...)
-        # Current out_logits: (Batch_Size, Num_Nodes, Num_Classes) -> (32, 9, 2)
-        # Current C_labels:   (Batch_Size, Num_Nodes)           -> (32, 9)
-        # We need to permute out_logits to (Batch_Size, Num_Classes, Num_Nodes) for cross_entropy.
-        # So, (32, 2, 9)
-        out_logits_permuted = out_logits.permute(0, 2, 1) # (Batch_Size, Num_Classes, Num_Nodes)
+        # Squeeze the last dimension to get (Batch_Size, Num_Nodes)
+        out_predicted_scores = out_predicted_scores_raw.squeeze(-1)
         
-        ce_loss = criterion(out_logits_permuted, C_labels)
+        # Calculate loss using ListNetLoss
+        # Create a mask for valid target scores (not NaN)
+        # This mask helps in calculating metrics correctly later, and can be used by loss if needed.
+        valid_target_mask = ~torch.isnan(C_target_scores)
+
+        # For ListNetLoss, we pass the raw scores. NaNs in C_target_scores are handled internally by the loss.
+        # However, if all target scores in a batch item are NaN, p_true might become uniform,
+        # and log_p_pred for those might be compared against it.
+        # We should only compute loss for batch items that have at least one valid target.
+        # For simplicity now, assume ListNetLoss handles internal NaNs in y_true_scores gracefully.
+        # A more robust approach might be to filter batches or mask loss contributions.
         
-        # Add theta regularizer from the paper
-        # The paper sums this directly, implying a weight of 1.0 for the regularization term.
-        # model.theta is (layers, num_relation, expansion_steps)
-        # theta_regularizer expects a single theta_param (num_relation, expansion_steps)
-        # We need to sum the regularization loss over all layers.
-        reg_loss = 0
-        for l_idx in range(model.layers): # model.layers was d_layers in train script
-            reg_loss += theta_regularizer(model.theta[l_idx])
+        # Filter out samples where all target scores are NaN to prevent issues with softmax or loss calculation
+        # if a sample has no valid information to learn from.
+        # A sample is valid if it has at least one non-NaN target score.
+        sample_has_valid_target = torch.any(valid_target_mask, dim=1)
+
+        if not torch.any(sample_has_valid_target):
+            # If no samples in the batch have any valid targets, skip loss calculation for this batch
+            # print(f"DEBUG Batch {i+1}: Skipping loss calculation as no samples have valid targets.")
+            loss = torch.tensor(0.0, device=device, requires_grad=True) # Or handle as appropriate
+        else:
+            # Filter inputs to the loss function to only include samples with at least one valid target
+            valid_pred_scores = out_predicted_scores[sample_has_valid_target]
+            valid_true_scores = C_target_scores[sample_has_valid_target]
+            
+            current_loss = criterion(valid_pred_scores, valid_true_scores)
+            loss = current_loss
         
-        # reg_lambda = 0.01 # Introduce regularization strength
-        # scaled_reg_loss = reg_lambda * reg_loss
-        # loss = ce_loss + scaled_reg_loss # Add scaled regularization to the loss
-        loss = ce_loss # Using only CE Loss, as theta_regularizer is commented out in demo notebook
-        if i % 10 == 0 or i == len(train_loader) -1 : # Print components periodically
-            # print(f"DEBUG Batch {i+1}: CE Loss: {ce_loss.item():.4f}, Reg Loss (unscaled): {reg_loss.item():.4f}, Scaled Reg Loss: {scaled_reg_loss.item():.4f}, Total Loss: {loss.item():.4f}")
-            print(f"DEBUG Batch {i+1}: CE Loss: {ce_loss.item():.4f}, Total Loss: {loss.item():.4f} (Theta Regularizer Disabled)")
-    
+        # Theta regularizer (if re-enabled, ensure it's compatible with the new loss structure)
+        # For now, keeping it disabled as per the original script's effective state.
+        # The debug print using 'i' and 'train_loader' was removed as it's out of scope here.
+    # <<< End of torch.amp.autocast block >>>
+
     # Backward pass and optimization
-    if use_amp:
+    if use_amp_flag: # Corrected variable name from use_amp to use_amp_flag
         if is_profiling:
             with record_function("model_backward_amp"):
                 scaler.scale(loss).backward()
+                # Gradient clipping after scaling, before optimizer step
+                scaler.unscale_(optimizer) # Unscale gradients before clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
-        else:
+        else: # Not profiling, but using AMP
             scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Added Gradient Clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
-    else:
+    else: # Not using AMP
         if is_profiling:
             with record_function("model_backward_no_amp"):
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Added Gradient Clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-        else:
+        else: # Not profiling and not using AMP
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Added Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
     
     # profiler.step() is now handled by the schedule, so no manual call here.
 
-    return loss, out_logits, C_labels
+    return loss, out_predicted_scores, C_target_scores, sample_has_valid_target
 
-epochs = 8 # Reduced for quick testing, notebook uses 10000
+epochs = 10 # Reduced for quick testing, notebook uses 10000
 model.reset_parameters()
 
 # --- AMP Scaler ---
@@ -583,13 +645,16 @@ for epoch in range(epochs):
                     print(f"Reached {i} batches, stopping profiling loop for this epoch.")
                     break # Stop after enough batches for the schedule
                 
-                loss, out_logits, C_labels = train_batch(sample, model, criterion, optimizer, device, scaler, use_amp_flag,
-                                                         is_profiling=True)
+                # train_batch now returns: loss, out_predicted_scores, C_target_scores, sample_has_valid_target
+                current_loss, _, _, _ = train_batch(
+                    sample, model, criterion, optimizer, device, scaler, use_amp_flag, is_profiling=True
+                )
                 
-                epoch_loss_sum += loss.item()
-                preds = out_logits.argmax(dim=2)
-                epoch_correct += (preds == C_labels).sum().item()
-                epoch_total_samples += C_labels.numel()
+                epoch_loss_sum += current_loss.item() # current_loss is already a scalar
+                
+                # Accuracy calculation is no longer relevant for ranking.
+                # We will implement ranking metrics (e.g., NDCG, Spearman correlation) later.
+                # For now, just track the loss.
                 
                 batch_num_display = i + 1
                 # prof.step() is called by the profiler due to the schedule
@@ -606,7 +671,8 @@ for epoch in range(epochs):
                 elif i < PROFILE_WAIT_STEPS + PROFILE_WARMUP_STEPS:
                     log_message_profiling_phase = f"(Profiler warming up, batch {i+1-PROFILE_WAIT_STEPS} of {PROFILE_WARMUP_STEPS})"
 
-                print(f"Epoch {epoch+1}/{epochs}, Batch {batch_num_display}/{len(train_loader)} {log_message_profiling_phase}: Loss={loss.item():.4f}")
+                # The variable 'loss' was changed to 'current_loss' in this scope
+                print(f"Epoch {epoch+1}/{epochs}, Batch {batch_num_display}/{len(train_loader)} {log_message_profiling_phase}: Loss={current_loss.item():.4f}")
             
             # --- Detailed Profiler Output (Inside 'with prof:' block, after the loop) ---
             print("\n--- Checking Raw Profiler Events (inside profiler context, after loop) ---")
@@ -666,73 +732,165 @@ for epoch in range(epochs):
                 if i < start_batch_idx_after_profiling:
                     continue # Skip already processed (profiled) batches
 
-                loss, out_logits, C_labels = train_batch(sample, model, criterion, optimizer, device, scaler, use_amp_flag,
-                                                         is_profiling=False)
+                # train_batch now returns: loss, out_predicted_scores, C_target_scores, sample_has_valid_target
+                # Unpack correctly, using current_loss for the loss value
+                current_loss, _out_predicted_scores, _C_target_scores, _sample_has_valid_target = train_batch(
+                    sample, model, criterion, optimizer, device, scaler, use_amp_flag, is_profiling=False
+                )
                 
-                epoch_loss_sum += loss.item()
-                preds = out_logits.argmax(dim=2)
-                epoch_correct += (preds == C_labels).sum().item()
-                epoch_total_samples += C_labels.numel()
-                if (i + 1) % 10 == 0:
-                     print(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(train_loader)}: Loss={loss.item():.4f}")
+                epoch_loss_sum += current_loss.item()
+                # Accuracy calculation removed
+                if (i + 1) % 10 == 0 or (i + 1) == len(train_loader): # Print for last batch too
+                     print(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(train_loader)}: Loss={current_loss.item():.4f}")
     
     else: # Regular training for epochs not targeted for profiling (or if PROFILE_ENABLED is False)
         for i, sample in enumerate(train_loader):
-            loss, out_logits, C_labels = train_batch(sample, model, criterion, optimizer, device, scaler, use_amp_flag,
-                                                     is_profiling=False)
+            # train_batch now returns: loss, out_predicted_scores, C_target_scores, sample_has_valid_target
+            # Unpack correctly, using current_loss for the loss value
+            current_loss, _out_predicted_scores, _C_target_scores, _sample_has_valid_target = train_batch(
+                sample, model, criterion, optimizer, device, scaler, use_amp_flag, is_profiling=False
+            )
             
-            epoch_loss_sum += loss.item()
-            preds = out_logits.argmax(dim=2)
-            epoch_correct += (preds == C_labels).sum().item()
-            epoch_total_samples += C_labels.numel()
-            if (i + 1) % 10 == 0:
-                 print(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(train_loader)}: Loss={loss.item():.4f}")
+            epoch_loss_sum += current_loss.item()
+            # Accuracy calculation removed
+            if (i + 1) % 10 == 0 or (i + 1) == len(train_loader): # Print for last batch too
+                 print(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(train_loader)}: Loss={current_loss.item():.4f}")
 
     # Epoch summary (common for all cases)
-    if epoch_total_samples > 0:
-        num_batches_in_loader = len(train_loader)
-        avg_epoch_loss = epoch_loss_sum / num_batches_in_loader if num_batches_in_loader > 0 else 0.0
-        avg_epoch_acc = epoch_correct / epoch_total_samples
-        print(f"Epoch {epoch+1}/{epochs} Summary: Avg Loss={avg_epoch_loss:.4f}, Avg Acc={avg_epoch_acc:.4f}")
-    elif len(train_loader) > 0:
+    # if epoch_total_samples > 0: # epoch_total_samples is no longer tracked this way
+    num_batches_in_loader = len(train_loader)
+    if num_batches_in_loader > 0 : # Check if any batches were processed
+        avg_epoch_loss = epoch_loss_sum / num_batches_in_loader
+        # avg_epoch_acc = epoch_correct / epoch_total_samples # Accuracy removed
+        print(f"Epoch {epoch+1}/{epochs} Summary: Avg Loss={avg_epoch_loss:.4f}") # Accuracy removed
+    elif len(train_loader) > 0: # This case might be redundant if num_batches_in_loader covers it
         print(f"Epoch {epoch+1}/{epochs} Summary: No samples processed in this epoch (loader size: {len(train_loader)}, dataset size: {len(train_dataset)}).")
     # If len(train_loader) == 0, the 'break' earlier handles it.
 
     # Validation step (optional, can be done less frequently)
+    # TODO: Update validation to use ranking metrics instead of classification metrics.
+    
+    # Define ndcg_k_values here so it's accessible in both validation and test loops
+    ndcg_k_values = [1, 10] # Define k values for NDCG
+
     if (epoch + 1) % 5 == 0 and len(val_loader) > 0:
         model.eval()
-        val_correct = 0
-        val_total_samples = 0
-        val_f1_scores = []
-        val_mcc_scores = []
+        val_loss_sum = 0
+        # val_correct = 0 # Classification metric
+        # val_total_samples = 0 # Classification metric
+        # val_f1_scores = [] # Classification metric
+        # val_mcc_scores = [] # Classification metric
+        
+        # Placeholder for ranking metrics
+        all_val_pred_scores_list = []
+        all_val_true_scores_list = []
+
         with torch.no_grad():
-            for val_sample in val_loader:
+            for i_val, val_sample in enumerate(val_loader):
                 X_val = val_sample['X'].to(device)
                 A_val = val_sample['A'].to(device)
-                C_val = val_sample['Y'].long().to(device)
+                C_val_target_scores = val_sample['Y'].float().to(device) # True scores
                 
                 with torch.amp.autocast('cuda', enabled=use_amp_flag):
-                    out_val_logits = model(X_val, A_val)
-                val_preds = out_val_logits.argmax(dim=2)
+                    out_val_predicted_scores_raw = model(X_val, A_val) # (Batch, Nodes, 1)
                 
-                val_correct += (val_preds == C_val).sum().item()
-                val_total_samples += C_val.numel()
-                val_f1_scores.append(f1_score(C_val.cpu().numpy().flatten(), val_preds.cpu().numpy().flatten(), zero_division=0))
-                val_mcc_scores.append(matthews_corrcoef(C_val.cpu().numpy().flatten(), val_preds.cpu().numpy().flatten()))
+                out_val_predicted_scores = out_val_predicted_scores_raw.squeeze(-1) # (Batch, Nodes)
+
+                # Filter for loss calculation (samples with at least one valid target)
+                val_sample_has_valid_target = torch.any(~torch.isnan(C_val_target_scores), dim=1)
+                if torch.any(val_sample_has_valid_target):
+                    valid_val_pred_scores = out_val_predicted_scores[val_sample_has_valid_target]
+                    valid_val_true_scores = C_val_target_scores[val_sample_has_valid_target]
+                    val_loss = criterion(valid_val_pred_scores, valid_val_true_scores)
+                    val_loss_sum += val_loss.item()
+                
+                # Store all scores for offline metric calculation (e.g., NDCG, Spearman)
+                all_val_pred_scores_list.append(out_val_predicted_scores.cpu())
+                all_val_true_scores_list.append(C_val_target_scores.cpu())
+
+        num_val_batches = len(val_loader)
+        avg_val_loss = val_loss_sum / num_val_batches if num_val_batches > 0 else 0
         
-        avg_val_acc = val_correct / val_total_samples if val_total_samples > 0 else 0
-        avg_val_f1 = sum(val_f1_scores) / len(val_f1_scores) if val_f1_scores else 0
-        avg_val_mcc = sum(val_mcc_scores) / len(val_mcc_scores) if val_mcc_scores else 0
-        print(f"Epoch {epoch+1} Validation: Acc={avg_val_acc:.4f}, F1={avg_val_f1:.4f}, MCC={avg_val_mcc:.4f}")
+        # Calculate and print ranking metrics
+        ndcg_k_values = [5, 10] # Define k values for NDCG
+        epoch_ndcg_scores = {k: [] for k in ndcg_k_values}
+        epoch_spearman_coeffs = []
+
+        if all_val_pred_scores_list and all_val_true_scores_list:
+            # Concatenate all batch results
+            # Each element in the list is a tensor of shape (batch_size_for_that_batch, num_nodes)
+            # We want to process each sample (row) individually.
+            
+            # First, flatten the lists of tensors into lists of individual sample tensors
+            flat_val_pred_scores = [item for batch_tensor in all_val_pred_scores_list for item in batch_tensor]
+            flat_val_true_scores = [item for batch_tensor in all_val_true_scores_list for item in batch_tensor]
+
+            for pred_scores_sample, true_scores_sample in zip(flat_val_pred_scores, flat_val_true_scores):
+                # pred_scores_sample and true_scores_sample are 1D tensors for a single graph/day
+                
+                # Filter out NaNs: only consider pairs where true_score is not NaN
+                valid_mask_sample = ~torch.isnan(true_scores_sample)
+                
+                if valid_mask_sample.sum() < 1: # Need at least 1 valid item for NDCG, 2 for Spearman
+                    continue
+
+                y_true_sample_np = true_scores_sample[valid_mask_sample].numpy()
+                y_pred_sample_np = pred_scores_sample[valid_mask_sample].numpy()
+
+                if len(y_true_sample_np) < 1: # Re-check after filtering, should be redundant if first check is <1
+                    continue
+
+                # NDCG
+                # Scale y_true_sample_np to be non-negative for NDCG
+                # Scale y_true_sample_np to be strictly positive for NDCG
+                y_true_scaled_for_ndcg = np.array([]) # Initialize as empty
+
+                if len(y_true_sample_np) > 0:
+                    unique_vals = np.unique(y_true_sample_np)
+                    if len(unique_vals) > 1:
+                        # Scale to [epsilon, 1.0] to ensure positivity
+                        scaler_ndcg = MinMaxScaler(feature_range=(1e-9, 1.0))
+                        y_true_scaled_for_ndcg = scaler_ndcg.fit_transform(y_true_sample_np.reshape(-1, 1)).flatten()
+                    elif len(unique_vals) == 1: # All values are the same
+                        y_true_scaled_for_ndcg = np.full_like(y_true_sample_np, 0.5) # Assign a constant positive relevance
+                # If y_true_sample_np was empty, y_true_scaled_for_ndcg remains empty.
+
+                # ndcg_score expects 2D arrays: (n_samples, n_labels). Here, n_samples=1 for each graph.
+                # y_true_scaled_for_ndcg contains non-negative relevance scores.
+                # y_pred_sample_np contains predicted scores.
+                for k_val in ndcg_k_values:
+                    if len(y_true_scaled_for_ndcg) >= 1: # Can compute NDCG if there's at least one item
+                        # Ensure k is not greater than the number of items
+                        current_k = min(k_val, len(y_true_scaled_for_ndcg))
+                        if current_k > 0:
+                            ndcg_val = ndcg_score([y_true_scaled_for_ndcg], [y_pred_sample_np], k=current_k)
+                            epoch_ndcg_scores[k_val].append(ndcg_val)
+                
+                # Spearman Correlation
+                if len(y_true_sample_np) >= 2: # Spearman needs at least 2 data points
+                    spearman_val, _ = spearmanr(y_true_sample_np, y_pred_sample_np)
+                    if not np.isnan(spearman_val): # spearmanr can return NaN if input is constant
+                        epoch_spearman_coeffs.append(spearman_val)
+
+        avg_ndcg_scores_str = ", ".join([f"NDCG@{k}={np.mean(scores):.4f}" if scores else f"NDCG@{k}=N/A" for k, scores in epoch_ndcg_scores.items()])
+        avg_spearman_coeff_str = f"Spearman={np.mean(epoch_spearman_coeffs):.4f}" if epoch_spearman_coeffs else "Spearman=N/A"
+        
+        print(f"Epoch {epoch+1} Validation: Avg Loss={avg_val_loss:.4f}, {avg_ndcg_scores_str}, {avg_spearman_coeff_str}")
 
 
 # --- Final Testing ---
 print("\nStarting final testing...")
 model.eval()
-test_correct = 0
-test_total_samples = 0
-test_f1_scores = []
-test_mcc_scores = []
+test_loss_sum = 0
+# test_correct = 0 # Classification metric
+# test_total_samples = 0 # Classification metric
+# test_f1_scores = [] # Classification metric
+# test_mcc_scores = [] # Classification metric
+
+# Placeholder for ranking metrics
+all_test_pred_scores_list = []
+all_test_true_scores_list = []
+
 
 if len(test_loader) == 0:
     print("Test loader is empty. Skipping testing.")
@@ -740,24 +898,77 @@ if len(test_loader) == 0:
         print("Underlying test dataset is also empty.")
 else:
     with torch.no_grad():
-        for test_sample in test_loader:
+        for i_test, test_sample in enumerate(test_loader):
             X_test = test_sample['X'].to(device)
             A_test = test_sample['A'].to(device)
-            C_test = test_sample['Y'].long().to(device)
+            C_test_target_scores = test_sample['Y'].float().to(device)
             
             with torch.amp.autocast('cuda', enabled=use_amp_flag):
-                out_test_logits = model(X_test, A_test)
-            test_preds = out_test_logits.argmax(dim=2)
+                out_test_predicted_scores_raw = model(X_test, A_test) # (Batch, Nodes, 1)
             
-            test_correct += (test_preds == C_test).sum().item()
-            test_total_samples += C_test.numel()
-            test_f1_scores.append(f1_score(C_test.cpu().numpy().flatten(), test_preds.cpu().numpy().flatten(), zero_division=0))
-            test_mcc_scores.append(matthews_corrcoef(C_test.cpu().numpy().flatten(), test_preds.cpu().numpy().flatten()))
+            out_test_predicted_scores = out_test_predicted_scores_raw.squeeze(-1) # (Batch, Nodes)
 
-    avg_test_acc = test_correct / test_total_samples if test_total_samples > 0 else 0
-    avg_test_f1 = sum(test_f1_scores) / len(test_f1_scores) if test_f1_scores else 0
-    avg_test_mcc = sum(test_mcc_scores) / len(test_mcc_scores) if test_mcc_scores else 0
-    print(f"Test Results: Accuracy={avg_test_acc:.4f}, F1 Score={avg_test_f1:.4f}, MCC={avg_test_mcc:.4f}")
+            # Filter for loss calculation
+            test_sample_has_valid_target = torch.any(~torch.isnan(C_test_target_scores), dim=1)
+            if torch.any(test_sample_has_valid_target):
+                valid_test_pred_scores = out_test_predicted_scores[test_sample_has_valid_target]
+                valid_test_true_scores = C_test_target_scores[test_sample_has_valid_target]
+                test_loss = criterion(valid_test_pred_scores, valid_test_true_scores)
+                test_loss_sum += test_loss.item()
+
+            all_test_pred_scores_list.append(out_test_predicted_scores.cpu())
+            all_test_true_scores_list.append(C_test_target_scores.cpu())
+
+    num_test_batches = len(test_loader)
+    avg_test_loss = test_loss_sum / num_test_batches if num_test_batches > 0 else 0
+    
+    # Calculate and print ranking metrics for Test set
+    test_ndcg_scores = {k: [] for k in ndcg_k_values}
+    test_spearman_coeffs = []
+
+    if all_test_pred_scores_list and all_test_true_scores_list:
+        flat_test_pred_scores = [item for batch_tensor in all_test_pred_scores_list for item in batch_tensor]
+        flat_test_true_scores = [item for batch_tensor in all_test_true_scores_list for item in batch_tensor]
+
+        for pred_scores_sample, true_scores_sample in zip(flat_test_pred_scores, flat_test_true_scores):
+            valid_mask_sample = ~torch.isnan(true_scores_sample)
+            if valid_mask_sample.sum() < 1:
+                continue
+            y_true_sample_np = true_scores_sample[valid_mask_sample].numpy()
+            y_pred_sample_np = pred_scores_sample[valid_mask_sample].numpy()
+
+            if len(y_true_sample_np) < 1:
+                continue
+
+            # Scale y_true_sample_np to be non-negative for NDCG for the test set
+            # Scale y_true_sample_np to be strictly positive for NDCG for the test set
+            y_true_scaled_for_ndcg_test = np.array([]) # Initialize as empty
+
+            if len(y_true_sample_np) > 0:
+                unique_vals_test = np.unique(y_true_sample_np)
+                if len(unique_vals_test) > 1:
+                    scaler_ndcg_test = MinMaxScaler(feature_range=(1e-9, 1.0))
+                    y_true_scaled_for_ndcg_test = scaler_ndcg_test.fit_transform(y_true_sample_np.reshape(-1, 1)).flatten()
+                elif len(unique_vals_test) == 1:
+                    y_true_scaled_for_ndcg_test = np.full_like(y_true_sample_np, 0.5)
+            # If y_true_sample_np was empty, y_true_scaled_for_ndcg_test remains empty.
+            
+            for k_val in ndcg_k_values:
+                if len(y_true_scaled_for_ndcg_test) >= 1:
+                    current_k = min(k_val, len(y_true_scaled_for_ndcg_test))
+                    if current_k > 0:
+                        ndcg_val = ndcg_score([y_true_scaled_for_ndcg_test], [y_pred_sample_np], k=current_k)
+                        test_ndcg_scores[k_val].append(ndcg_val)
+            
+            if len(y_true_sample_np) >= 2:
+                spearman_val, _ = spearmanr(y_true_sample_np, y_pred_sample_np)
+                if not np.isnan(spearman_val):
+                    test_spearman_coeffs.append(spearman_val)
+
+    avg_test_ndcg_str = ", ".join([f"NDCG@{k}={np.mean(scores):.4f}" if scores else f"NDCG@{k}=N/A" for k, scores in test_ndcg_scores.items()])
+    avg_test_spearman_str = f"Spearman={np.mean(test_spearman_coeffs):.4f}" if test_spearman_coeffs else "Spearman=N/A"
+
+    print(f"Test Results: Avg Loss={avg_test_loss:.4f}, {avg_test_ndcg_str}, {avg_test_spearman_str}")
 
 # --- Save Model ---
 # The notebook had a prompt, using a fixed name here for simplicity.

@@ -1,25 +1,67 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F # Added for potential use, though not in current snippet
+from typing import Tuple # Import Tuple for type hinting
 
 class MultiReDiffusion(torch.nn.Module):
-    def __init__(self, input_dim, output_dim, num_relation):
+    """
+    Implements the Multi-relational Graph Diffusion layer as described in the MGDPR paper.
+    This layer refines graph structures by learning task-optimal edges adaptively.
+    Corresponds to Section 4.2 of the paper.
+    """
+    def __init__(self, input_dim: int, output_dim: int, num_relation: int):
+        """
+        Args:
+            input_dim (int): Feature dimension of the input node representations (H_{l-1}).
+            output_dim (int): Feature dimension after the relational linear transformation (W_l^r).
+            num_relation (int): Number of relations |R|.
+        """
         super(MultiReDiffusion, self).__init__()
-        self.input_dim = input_dim  # Store input_dim for FC vectorization
-        self.output_dim = output_dim  # Store output_dim, was self.output
+        self.input_dim = input_dim
+        self.output_dim = output_dim
         self.num_relation = num_relation
         
+        # Corresponds to W_l^r in the paper, one for each relation
         self.fc_layers_list = nn.ModuleList([nn.Linear(input_dim, output_dim) for _ in range(num_relation)])
         
+        # Corresponds to Conv2d_{1x1} in the paper
         self.update_layer = torch.nn.Conv2d(num_relation, num_relation, kernel_size=1)
-        self.activation1 = torch.nn.PReLU()
-        self.activation0 = torch.nn.PReLU()
+        self.activation1 = torch.nn.PReLU() # sigma after Conv2d
+        self.activation0 = torch.nn.PReLU() # sigma after W_l^r H_{l-1}
 
-    def forward(self, theta_param, t_param, a_input_batched, x_input_batched):
-        # theta_param: (Num_Relations, Expansion_Steps)
-        # t_param: (Num_Relations, Expansion_Steps, Num_Nodes, Num_Nodes)
-        # a_input_batched: (Batch_Size, Num_Relations, Num_Nodes, Num_Nodes)
-        # x_input_batched: (Batch_Size, Num_Relations, Num_Nodes, Features_Input_Dim)
+    def forward(self, theta_param: torch.Tensor, t_param: torch.Tensor, a_input_batched: torch.Tensor, x_input_batched: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for Multi-relational Graph Diffusion.
+
+        Args:
+            theta_param (torch.Tensor): Learnable weight coefficients gamma_{l,r,k}.
+                                        Shape: (Num_Relations, Expansion_Steps).
+            t_param (torch.Tensor): Learnable column-stochastic transition matrices T_{l,r,k}.
+                                    Shape: (Num_Relations, Expansion_Steps, Num_Nodes, Num_Nodes).
+            a_input_batched (torch.Tensor): Batched adjacency matrices A_{t,r}.
+                                            Shape: (Batch_Size, Num_Relations, Num_Nodes, Num_Nodes).
+            x_input_batched (torch.Tensor): Batched input node features H_{l-1}.
+                                            Shape: (Batch_Size, Num_Relations, Num_Nodes, Features_Input_Dim).
+        
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - latent_feat_batch (H_l): Latent diffusion representation.
+                                           Shape: (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC).
+                - diffusions_batch (U_l): Intermediate representation before Conv2d, used for Parallel Retention.
+                                          Shape: (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC).
+                                          (Note: In this implementation, U_l is effectively H_l before the final update_layer activation,
+                                           but the paper's diagram suggests U_l might be S_{l,r}H_{l-1}W_l^r.
+                                           Here, we return the output of fc_layers + activation0 as the second element,
+                                           and the output after Conv2d + activation1 as the first.)
+                                           For simplicity and matching original logic, returning (latent_feat_batch, latent_feat_batch)
+                                           if diffusions_batch is not explicitly needed elsewhere with a different value.
+                                           The current return is (output_after_conv2d, output_after_conv2d).
+                                           Let's refine to return (output_after_conv2d, output_before_conv2d_but_after_fc_activation0)
+        """
+        # theta_param (gamma_{l,r,k}): (Num_Relations, Expansion_Steps)
+        # t_param (T_{l,r,k}): (Num_Relations, Expansion_Steps, Num_Nodes, Num_Nodes)
+        # a_input_batched (A_{t,r}): (Batch_Size, Num_Relations, Num_Nodes, Num_Nodes)
+        # x_input_batched (H_{l-1}): (Batch_Size, Num_Relations, Num_Nodes, Features_Input_Dim)
 
         device = x_input_batched.device
         batch_size = x_input_batched.shape[0]
@@ -30,7 +72,9 @@ class MultiReDiffusion(torch.nn.Module):
 
         # 1. Calculate diffusion_mats_batched
         # theta_param: (R, E) -> reshape to (1, R, E, 1, 1) for broadcasting
-        theta_p_exp = theta_param.unsqueeze(0).unsqueeze(3).unsqueeze(4)
+        # Apply softmax to theta_param to ensure coefficients sum to 1 over expansion steps, as per paper's constraint.
+        theta_param_normalized = torch.softmax(theta_param, dim=-1)
+        theta_p_exp = theta_param_normalized.unsqueeze(0).unsqueeze(3).unsqueeze(4)
         
         # Normalize t_param along the node dimension (dim=2 of t_param, which is N_source for M_ij)
         # t_param original shape: (R, E, N_target, N_source)
@@ -51,21 +95,21 @@ class MultiReDiffusion(torch.nn.Module):
         # Resulting terms shape: (B, R, E, N, N) due to broadcasting
         terms = theta_p_exp * t_p_exp * a_in_b_exp
         
-        # Sum over Expansion_Steps dimension
-        # diffusion_mats_batched: (B, R, N, N)
+        # Sum over Expansion_Steps dimension (k) to get S_{l,r}
+        # diffusion_mats_batched (S_{l,r}): (Batch_Size, Num_Relations, Num_Nodes, Num_Nodes)
         diffusion_mats_batched = torch.sum(terms, dim=2)
 
-        # 2. Calculate diffusion_feats_batched
+        # 2. Calculate S_{l,r} H_{l-1}
         # diffusion_mats_batched: (B, R, N, N)
-        # x_input_batched: (B, R, N, F_in) where F_in is self.input_dim
-        # torch.matmul will batch over B and R dimensions: (N,N) @ (N,F_in) -> (N,F_in)
-        # diffusion_feats_batched: (B, R, N, F_in)
+        # x_input_batched (H_{l-1}): (Batch_Size, Num_Relations, Num_Nodes, Features_Input_Dim)
+        # torch.matmul will batch over Batch_Size and Num_Relations dimensions: (N,N) @ (N,F_in) -> (N,F_in)
+        # diffusion_feats_batched (S_{l,r}H_{l-1}): (Batch_Size, Num_Relations, Num_Nodes, Features_Input_Dim)
         diffusion_feats_batched = torch.matmul(diffusion_mats_batched, x_input_batched)
 
-        # 3. Apply FC layers (self.fc_layers_list) and activation0, vectorized over relations
-        # diffusion_feats_batched: (B, R, N, F_in)
+        # 3. Apply relational linear transformation W_l^r and activation sigma
+        # diffusion_feats_batched (S_{l,r}H_{l-1}): (Batch_Size, Num_Relations, Num_Nodes, Features_Input_Dim)
         
-        # Stack weights and biases from self.fc_layers_list
+        # Stack weights (W_l^r) and biases from self.fc_layers_list
         # all_fc_weights: (R, F_out, F_in)
         all_fc_weights = torch.stack([layer.weight for layer in self.fc_layers_list], dim=0)
         # all_fc_biases: (R, F_out)
@@ -109,86 +153,96 @@ class MultiReDiffusion(torch.nn.Module):
         # (R, B, N, F_out) -> (B, R, N, F_out)
         fc_outputs_batched = fc_outputs_reshaped.permute(1, 0, 2, 3)
 
-        # Apply activation0
-        # diffusions_batch: (B, R, N, F_out)
-        diffusions_batch = self.activation0(fc_outputs_batched)
+        # Apply activation0 (sigma)
+        # u_intermediate_for_retention (U_l in paper, or part of H_l before Conv2d): (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
+        # This is sigma(S_{l,r} H_{l-1} W_l^r)
+        u_intermediate_for_retention = self.activation0(fc_outputs_batched)
         
-        # 4. Apply update_layer and activation1
-        # diffusions_batch shape: (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
-        # This is the expected input shape for self.update_layer (Conv2d)
-        # Input: (Batch_Size, Channels_in=Num_Relations, H=Num_Nodes, W=Features_Output_FC)
-        latent_feat_batch = self.activation1(self.update_layer(diffusions_batch))
-        # latent_feat_batch shape: (Batch_Size, Num_Relations_out, Num_Nodes, Features_Output_FC)
+        # 4. Apply Conv2d_{1x1} and activation1 (sigma) to get H_l
+        # u_intermediate_for_retention shape: (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
+        # This is the input to self.update_layer (Conv2d).
+        # Input to Conv2d: (Batch_Size, Channels_in=Num_Relations, H=Num_Nodes, W=Features_Output_FC)
+        # latent_feat_batch (H_l): (Batch_Size, Num_Relations, Num_Nodes, Features_Output_FC)
         # Since self.update_layer is Conv2d(num_relation, num_relation, ...), Num_Relations_out = Num_Relations.
+        latent_feat_batch = self.activation1(self.update_layer(u_intermediate_for_retention))
 
-        # Return (h_diffused, u_intermediate)
-        # As per original logic, both can be latent_feat_batch
-        return latent_feat_batch, latent_feat_batch
+        # H_l is latent_feat_batch
+        # U_l (input to Parallel Retention) is u_intermediate_for_retention (output of FC layers + activation0)
+        return latent_feat_batch, u_intermediate_for_retention
 
 
 class ParallelRetention(torch.nn.Module):
-    def __init__(self, time_dim, in_dim, inter_dim, out_dim, num_gn_groups=32): # num_gn_groups will be unused now
+    """
+    Implements the Parallel Retention mechanism as described in the MGDPR paper.
+    This mechanism aims to capture long-term dependencies in stock time series.
+    Corresponds to Eq. 4 in Section 4.3 of the paper: eta(Z) = phi((Q K^T elementwise_prod D) V).
+    """
+    def __init__(self, time_dim: int, in_dim: int, inter_dim: int, out_dim: int, num_gn_groups: int = 32):
+        """
+        Args:
+            time_dim (int): The sequence length for retention (T in paper's D matrix).
+                            In MGDPR, this corresponds to `time_steps` (window size) from the input data.
+            in_dim (int): Feature dimension of the input Z to the Q, K, V linear layers.
+                          This is derived from reshaping the input from diffusion layers.
+                          Specifically, (Num_Relations * Num_Nodes * Features_from_Diffusion) / time_dim.
+            inter_dim (int): Intermediate feature dimension for Q, K, V projections.
+            out_dim (int): Output feature dimension after the final linear layer (ret_feat).
+            num_gn_groups (int): Number of groups for Group Normalization (phi).
+        """
         super(ParallelRetention, self).__init__()
-        # The paper's Parallel Retention (Eq 4) takes Z (node features over time/relations).
-        # Z has dimensions like (num_nodes, feature_dim_from_diffusion) or (time_steps, feature_dim)
-        # In the MGDPR forward pass, `u` is passed to retention. `u` is (num_relation, num_nodes, diffusion_output_dim)
-        # The retention_layers are initialized with retention[3*i], retention[3*i+1], retention[3*i+2]
-        # These correspond to in_dim, inter_dim, out_dim for retention.
-        # The `time_dim` parameter in init is `time_dim` from MGDPR init, which is `time_steps` (window size).
-        # However, in forward(self, x, d_gamma): x is `u` which is (num_relation, num_nodes, features)
-        # x = x.view(self.time_dim, -1) -> this reshapes `u`
-        # This implies `time_dim` in ParallelRetention's init should match the first dimension of the reshaped `u`.
-        # If `u` is (num_relation, num_nodes, features), and reshaped to (self.time_dim, something),
-        # then num_relation must be self.time_dim. This seems to be a mismatch with `time_steps`.
-        # Let's look at the paper's Fig 1 and Eq 4. eta(H_l) where H_l is latent diffusion representation.
-        # H_l is (num_relation, num_nodes, features).
-        # Parallel retention in paper: Q = ZW_Q, K = ZW_K, V = ZW_V. D is decay matrix (T x T).
-        # eta(Z) = phi((QK^T . D)V). Z is (T x feature_dim) if T is sequence length.
-        # In the code, x (which is `u`) is (num_relation, num_nodes, features_from_diffusion).
-        # x.view(self.time_dim, -1) means num_relation is treated as the "time" or sequence dimension for retention.
-        # So, self.time_dim in ParallelRetention should correspond to num_relation.
-        # And in_dim should be num_nodes * features_from_diffusion. This seems complex.
-
-        # Let's re-evaluate based on `demo.ipynb` usage:
-        # `retention_layers` are init with `ParallelRetention(time_dim, ...)` where `time_dim` is `time_steps` (window size).
-        # `u` passed to `retention_layers[l](u, self.D_gamma)` is `(num_relation, num_nodes, features)`.
-        # Inside `ParallelRetention.forward(self, x, d_gamma)`:
-        # `x` is `u`. `x.shape[1]` is `num_nodes`.
-        # `x = x.view(self.time_dim, -1)`: this means `x` (num_relation, num_nodes, features) is reshaped.
-        # For this view to work, `num_relation * num_nodes * features == self.time_dim * something`.
-        # This implies `self.time_dim` (which is `time_steps` from MGDPR init) is the first dimension of the view.
-        # This means `num_relation` is being treated as the sequence length for retention.
-        # And `in_dim` for Q,K,V layers is `(num_nodes * features_from_diffusion)`.
-        # `d_gamma` is (time_dim, time_dim) i.e. (num_relation, num_relation).
-        # This interpretation means retention operates over the relations.
-
-        self.time_dim = time_dim # This is num_relation if my interpretation above is correct for the view
-        self.in_dim = in_dim # This is (num_nodes * features_from_diffusion) / num_relation
+        self.time_dim = time_dim
+        self.in_dim = in_dim
         self.inter_dim = inter_dim
         self.out_dim = out_dim
 
-        # Group Normalization removed to match demo notebook's ParallelRetention implementation
-        # if self.inter_dim % num_gn_groups == 0:
-        #     self.group_norm = nn.GroupNorm(num_gn_groups, self.inter_dim)
-        # else:
-        #     # Fallback to 1 group (similar to LayerNorm over channels) if inter_dim is not divisible
-        #     # Or if inter_dim is smaller than num_gn_groups
-        #     print(f"Warning: ParallelRetention inter_dim {self.inter_dim} not divisible by num_gn_groups {num_gn_groups}. Using num_groups=1 for GroupNorm.")
-        #     self.group_norm = nn.GroupNorm(1, self.inter_dim)
+        # Group Normalization (phi function from paper)
+        # The paper specifies phi as Group Normalization.
+        if self.inter_dim > 0:
+            if self.inter_dim % num_gn_groups != 0:
+                print(f"Warning: ParallelRetention inter_dim {self.inter_dim} is not divisible by num_gn_groups {num_gn_groups}. "
+                      f"Adjusting num_gn_groups to 1 or a divisor if possible, or ensure inter_dim is appropriate.")
+            # Ensure num_gn_groups is valid and does not exceed inter_dim.
+            # If inter_dim is small, num_gn_groups might need to be 1.
+            effective_num_gn_groups = num_gn_groups
+            if self.inter_dim < num_gn_groups : # If inter_dim is less than requested groups, use 1 or inter_dim itself if inter_dim is a valid group number
+                 effective_num_gn_groups = 1 # Fallback to 1 group if inter_dim is too small for requested groups
+                 if self.inter_dim > 0 and self.inter_dim % 1 == 0 : # if inter_dim itself can be a group number
+                     pass # keep effective_num_gn_groups = 1 or consider self.inter_dim if it makes sense
+            elif self.inter_dim > 0 and self.inter_dim % num_gn_groups != 0: # If not divisible, try to find a divisor or default to 1
+                # Simplified: default to 1 if not perfectly divisible by requested num_gn_groups.
+                # A more sophisticated approach might find the largest divisor or allow configuration.
+                print(f"Adjusting num_gn_groups to 1 for inter_dim {self.inter_dim} as it's not divisible by {num_gn_groups}.")
+                effective_num_gn_groups = 1
+            
+            if effective_num_gn_groups == 0 and self.inter_dim > 0: # Should not happen with min(num_gn_groups, self.inter_dim) logic if inter_dim > 0
+                effective_num_gn_groups = 1 # Safety net
+
+            self.group_norm = nn.GroupNorm(effective_num_gn_groups, self.inter_dim) if self.inter_dim > 0 else nn.Identity()
+        else: # inter_dim is 0 or less (should not happen with proper config)
+            self.group_norm = nn.Identity()
             
         self.activation = torch.nn.PReLU()
-        self.Q_layers = nn.Linear(self.in_dim, self.inter_dim)
-        self.K_layers = nn.Linear(self.in_dim, self.inter_dim)
-        self.V_layers = nn.Linear(self.in_dim, self.inter_dim)
-        self.ret_feat = torch.nn.Linear(self.inter_dim, self.out_dim)
+        self.Q_layers = nn.Linear(self.in_dim, self.inter_dim) # W_Q
+        self.K_layers = nn.Linear(self.in_dim, self.inter_dim) # W_K
+        self.V_layers = nn.Linear(self.in_dim, self.inter_dim) # W_V
+        self.ret_feat = torch.nn.Linear(self.inter_dim, self.out_dim) # Final linear layer
 
-    def forward(self, x_batched, d_gamma_batched):
-        # x_batched: (Batch_Size, Num_Relations, Num_Nodes, Features_from_Diffusion)
-        # d_gamma_batched: (Batch_Size, Time_Dim_Retention, Time_Dim_Retention)
-        #      or d_gamma: (Time_Dim_Retention, Time_Dim_Retention) to be broadcasted/repeated.
-        #      self.time_dim is Time_Dim_Retention (e.g., window_size)
-        #      self.in_dim is the feature dimension for QKV layers after reshaping x_sample.
+    def forward(self, x_batched: torch.Tensor, d_gamma_batched: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for Parallel Retention.
 
+        Args:
+            x_batched (torch.Tensor): Batched input features (Z in paper, derived from U_l).
+                                      Shape: (Batch_Size, Num_Relations, Num_Nodes, Features_from_Diffusion).
+            d_gamma_batched (torch.Tensor): Batched decay matrix D.
+                                            Shape: (Batch_Size, Time_Dim_Retention, Time_Dim_Retention) or
+                                                   (Time_Dim_Retention, Time_Dim_Retention) for broadcasting.
+                                            Time_Dim_Retention is self.time_dim (e.g., window_size).
+        
+        Returns:
+            torch.Tensor: Output of the retention mechanism (eta_batch).
+                          Shape: (Batch_Size, Num_Nodes, Features_after_Retention).
+        """
         device = x_batched.device
         batch_size = x_batched.shape[0]
         num_nodes_original = x_batched.shape[2] # Num_Nodes
@@ -229,12 +283,19 @@ class ParallelRetention(torch.nn.Module):
 
             retained_x_sample = torch.matmul(current_d_gamma * inter_feat_sample, v_sample) # (time_dim, inter_dim)
             
-            # Group Normalization removed here to match demo notebook's ParallelRetention implementation
-            # retained_x_sample_norm_input = retained_x_sample.transpose(0, 1).unsqueeze(0) # (1, inter_dim, time_dim)
-            # normalized_retained_x = self.group_norm(retained_x_sample_norm_input)
-            # normalized_retained_x = normalized_retained_x.squeeze(0).transpose(0, 1) # Back to (time_dim, inter_dim)
+            # Apply Group Normalization (phi function from paper)
+            if self.inter_dim > 0: # Apply only if inter_dim is valid for GroupNorm
+                # GroupNorm expects input (N, C, ...) where C is number of channels (self.inter_dim)
+                # retained_x_sample is (time_dim, inter_dim)
+                # Reshape for GroupNorm: (1, inter_dim, time_dim) assuming N=1 sample for GN
+                retained_x_sample_norm_input = retained_x_sample.transpose(0, 1).unsqueeze(0)
+                normalized_retained_x = self.group_norm(retained_x_sample_norm_input)
+                # Reshape back to (time_dim, inter_dim)
+                retained_x_for_activation = normalized_retained_x.squeeze(0).transpose(0, 1)
+            else:
+                retained_x_for_activation = retained_x_sample # Skip GN if inter_dim is 0
 
-            output_x_sample = self.activation(self.ret_feat(retained_x_sample)) # (time_dim, out_dim)
+            output_x_sample = self.activation(self.ret_feat(retained_x_for_activation)) # (time_dim, out_dim)
 
             # Reshape to (Num_Nodes, Features_after_Retention)
             # This requires self.time_dim * self.out_dim to be divisible by num_nodes_original.
@@ -253,8 +314,42 @@ class ParallelRetention(torch.nn.Module):
 
 
 class MGDPR(nn.Module):
-    def __init__(self, diffusion_config, retention_config, ret_linear_1_config, ret_linear_2_config, post_pro_config,
-                 layers, num_nodes, time_dim, num_relation, retention_decay_zeta, expansion_steps, regularization_gamma_param=None): # Changed gamma to retention_decay_zeta, added optional regularization_gamma_param
+    """
+    Multi-relational Graph Diffusion Neural Network with Parallel Retention (MGDPR).
+    This is the main model class that integrates MultiReDiffusion and ParallelRetention
+    layers to perform stock trend classification, as described in the paper.
+    It follows the architecture outlined in Figure 1 and Section 4 of the paper.
+    """
+    def __init__(self, diffusion_config: list, retention_config: list,
+                 ret_linear_1_config: list, ret_linear_2_config: list,
+                 post_pro_config: list, layers: int, num_nodes: int,
+                 time_dim: int, num_relation: int, retention_decay_zeta: float,
+                 expansion_steps: int, regularization_gamma_param: float = None):
+        """
+        Args:
+            diffusion_config (list): Configuration for the fc_layers within MultiReDiffusion blocks.
+                                     Flat list: [in_fc_MD0, out_fc_MD0, in_fc_MD1, out_fc_MD1, ...].
+                                     The input to the first MultiReDiffusion's fc_layers is `time_dim` (features of initial X).
+            retention_config (list): Configuration for ParallelRetention blocks.
+                                     Flat list: [in_PR0, inter_PR0, out_PR0, in_PR1, inter_PR1, out_PR1, ...].
+                                     `in_PR_l` is (num_relation * num_nodes * diffusion_config_out_l) / time_dim.
+            ret_linear_1_config (list): Configuration for the first set of linear layers in the retention skip-connection path.
+                                        Flat list: [in_RL1_0, out_RL1_0, in_RL1_1, out_RL1_1, ...].
+            ret_linear_2_config (list): Configuration for the second set of linear layers in the retention skip-connection path.
+                                        Flat list: [in_RL2_0, out_RL2_0, in_RL2_1, out_RL2_1, ...].
+            post_pro_config (list): Configuration for the final MLP layers.
+                                    Flat list: [in_MLP, hidden1_MLP, ..., out_classes_MLP].
+            layers (int): Number of MGDPR layers (L in paper). Each layer consists of a MultiReDiffusion
+                          block followed by a ParallelRetention block and skip connections.
+            num_nodes (int): Number of nodes (stocks) in the graph (N).
+            time_dim (int): Number of time steps in the input features (tau from paper, also used as T for D_gamma).
+            num_relation (int): Number of relations |R|.
+            retention_decay_zeta (float): Decay coefficient zeta for the D_gamma matrix in ParallelRetention.
+            expansion_steps (int): Expansion step K for graph diffusion.
+            regularization_gamma_param (float, optional): Regularization strength for the diffusion constraint.
+                                                          (Note: constraint now handled by softmax in MultiReDiffusion).
+                                                          Defaults to None.
+        """
         super(MGDPR, self).__init__()
 
         self.layers = layers

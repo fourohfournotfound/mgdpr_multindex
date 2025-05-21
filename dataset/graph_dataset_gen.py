@@ -46,16 +46,60 @@ def _mp_worker_graph_generation_task(
         if X_features_full_window.shape[2] != window + 1:
             return i_graph_idx, "error_feature_matrix_shape", f"Node feature matrix for graph {i_graph_idx} has incorrect time steps: {X_features_full_window.shape[2]}, expected {window + 1}"
 
-        C_labels = torch.zeros(X_features_full_window.shape[1]) # Labels based on number of companies
+        # --- START: New Target Variable Calculation (Volatility-Adjusted, Z-Scored Returns) ---
+        num_companies_in_graph = X_features_full_window.shape[1]
+        # Initialize with NaNs, as some stocks might not have valid targets
+        raw_vol_adj_returns_list = [float('nan')] * num_companies_in_graph
+        
+        target_date_str = current_window_dates_str_slice[-1] # This is t+1, the day for which we predict the return
+        target_date_dt = pd.to_datetime(target_date_str)
 
-        close_price_feature_idx = 3 # Assuming 'Close' is the 4th feature (0-indexed)
-        for company_idx in range(C_labels.shape[0]):
-            last_day_close = X_features_full_window[close_price_feature_idx, company_idx, -1]
-            prev_day_close = X_features_full_window[close_price_feature_idx, company_idx, -2]
+        for company_idx in range(num_companies_in_graph):
+            company_ticker = comlist[company_idx] # comlist is passed to the worker
             
-            if last_day_close != 0 and prev_day_close != 0:
-                if last_day_close > prev_day_close:
-                    C_labels[company_idx] = 1
+            try:
+                # Access pre-calculated DailyReturn and Volatility_20d from the main DataFrame
+                # These are for the target_date_dt (t+1)
+                # DailyReturn at t+1 is (Close_t+1 - Close_t) / Close_t
+                # Volatility_20d at t+1 is std_dev of DailyReturns up to t+1 (using returns from t-18 to t+1)
+                next_day_return = my_dataset_instance.stock_data_df.loc[(company_ticker, target_date_dt), 'DailyReturn']
+                volatility = my_dataset_instance.stock_data_df.loc[(company_ticker, target_date_dt), 'Volatility_20d']
+
+                if pd.notna(next_day_return) and pd.notna(volatility):
+                    if abs(volatility) > 1e-8: # Avoid division by zero or very small volatility
+                        raw_vol_adj_returns_list[company_idx] = next_day_return / volatility
+                    # else: remains NaN if volatility is too low (or zero)
+                # else: remains NaN if next_day_return or volatility is NaN
+            except KeyError:
+                # Data might not be present for this specific ticker/date in the main df, leave as NaN
+                # This handles cases where a stock might not have data for target_date_dt
+                pass # raw_vol_adj_returns_list[company_idx] remains NaN
+
+        raw_vol_adj_returns_tensor = torch.tensor(raw_vol_adj_returns_list, dtype=torch.float32)
+
+        # Cross-sectional Z-scoring for the current day's (target_date_str) vol-adjusted returns
+        valid_returns_mask = ~torch.isnan(raw_vol_adj_returns_tensor)
+        C_labels = torch.full((num_companies_in_graph,), float('nan'), dtype=torch.float32) # Initialize final labels with NaNs
+
+        if valid_returns_mask.any():
+            valid_vol_adj_returns = raw_vol_adj_returns_tensor[valid_returns_mask]
+            
+            if len(valid_vol_adj_returns) > 1: # Need at least 2 points for a meaningful std dev
+                mean_val = torch.mean(valid_vol_adj_returns)
+                std_val = torch.std(valid_vol_adj_returns)
+                
+                if std_val > 1e-8: # Avoid division by zero if std is very small
+                    C_labels[valid_returns_mask] = (valid_vol_adj_returns - mean_val) / std_val
+                else:
+                    # If std is zero (all valid returns are the same), their z-score is 0
+                    C_labels[valid_returns_mask] = 0.0
+            elif len(valid_vol_adj_returns) == 1:
+                # If only one valid stock, its z-score is conventionally 0
+                # (it's its own mean, std is undefined but for ranking purposes, it's neutral)
+                 C_labels[valid_returns_mask] = 0.0
+        # else: if no valid_vol_adj_returns found for this day, C_labels remains all NaNs.
+        # This graph might be unusable or needs special handling in the loss/training.
+        # --- END: New Target Variable Calculation ---
         
         X_processed = X_features_full_window[:, :, :-1].clone()
 
@@ -69,8 +113,21 @@ def _mp_worker_graph_generation_task(
 
         A_adj = torch.zeros((X_processed.shape[0], X_processed.shape[1], X_processed.shape[1]))
         for l_feature_idx in range(A_adj.shape[0]):
-            A_adj[l_feature_idx] = my_dataset_instance.adjacency_matrix(X_processed[l_feature_idx]) 
+            A_adj[l_feature_idx] = my_dataset_instance.adjacency_matrix(X_processed[l_feature_idx])
         
+        # Temporary print statements for debugging A_adj statistics
+        if i_graph_idx < 3: # Log for the first 3 graphs generated by any worker
+            print(f"DEBUG Adjacency Matrix Stats for graph {i_graph_idx} (File: {os.path.basename(graph_file_path)}):")
+            for rel_idx in range(A_adj.shape[0]):
+                adj_slice = A_adj[rel_idx]
+                print(f"  Relation {rel_idx}:")
+                print(f"    Min: {adj_slice.min().item():.4e}, Max: {adj_slice.max().item():.4e}, Mean: {adj_slice.mean().item():.4e}")
+                print(f"    Has NaN: {torch.isnan(adj_slice).any().item()}, Has Inf: {torch.isinf(adj_slice).any().item()}")
+            # Also log label distribution for this graph
+            unique_labels, counts = torch.unique(C_labels, return_counts=True)
+            label_dist_str = ", ".join([f"Label {l.item()}: {c.item()}" for l, c in zip(unique_labels, counts)])
+            print(f"  Label Distribution for graph {i_graph_idx}: {label_dist_str}")
+
         torch.save({'X': X_processed, 'A': A_adj, 'Y': C_labels}, graph_file_path)
         return i_graph_idx, "success", graph_file_path
     except Exception as e:
@@ -80,7 +137,42 @@ def _mp_worker_graph_generation_task(
 
 
 class MyDataset(Dataset):
+    """
+    Custom PyTorch Dataset for MGDPR model.
+    Handles loading stock data from a single CSV, processing it into a MultiIndex DataFrame,
+    and generating graph structures (.pt files) for specified time windows.
+    Each graph file contains node features (X), adjacency matrices (A) per relation (feature),
+    and node labels (Y) for stock trend classification.
+
+    The graph generation process involves:
+    1. Loading a comprehensive stock data CSV.
+    2. Filtering data for a given list of companies (comlist) and date range.
+    3. For each valid time step, creating a lookback window of `window` days.
+    4. Extracting node features (Open, High, Low, Close, Volume) for each stock in the window.
+    5. Calculating an adjacency matrix for each feature type (relation) based on signal energy
+       and information entropy, as per the MGDPR paper (Section 4.1).
+    6. Determining node labels based on the price movement of the next day (relative to the window end).
+    7. Saving each graph (X, A, Y) as a .pt file.
+    
+    The dataset uses multiprocessing for efficient graph generation if files are missing or incomplete.
+    """
     def __init__(self, root_csv_path: str, desti: str, market: str, comlist: List[str], start: str, end: str, window: int, dataset_type: str):
+        """
+        Initializes the dataset, loads stock data, and triggers graph generation if needed.
+
+        Args:
+            root_csv_path (str): Path to the single CSV file containing all stock data.
+                                 Expected columns: Ticker, Date, Open, High, Low, Close, Volume.
+            desti (str): Destination directory where processed graph .pt files will be saved.
+                         A subdirectory will be created here named:
+                         f'{market}_{dataset_type}_{start_date}_{end_date}_{window_size}'.
+            market (str): Name of the market (e.g., "NASDAQ", "Shortlist"). Used for naming the graph directory.
+            comlist (List[str]): List of stock tickers to include in the dataset.
+            start (str): Start date string for the dataset period (YYYY-MM-DD).
+            end (str): End date string for the dataset period (YYYY-MM-DD).
+            window (int): Lookback window size (tau in paper) for constructing graph features.
+            dataset_type (str): Type of dataset (e.g., "Train", "Validation", "Test"). Used for naming.
+        """
         print("--- DEBUG: MyDataset __init__ ENTERED ---") # Very simple debug print
         super().__init__()
 
@@ -193,6 +285,29 @@ class MyDataset(Dataset):
 
             self.stock_data_df = self.stock_data_df.set_index(['Ticker', 'Date'])
             self.stock_data_df = self.stock_data_df.sort_index()
+
+            # --- START: New code for target variable calculation prerequisites ---
+            if not self.stock_data_df.empty:
+                # Calculate Daily Returns
+                # Group by Ticker, then calculate percentage change for 'Close' prices
+                # Using apply with lambda for explicit group-wise operation.
+                self.stock_data_df['DailyReturn'] = self.stock_data_df.groupby(level='Ticker', group_keys=False)['Close'].apply(lambda x: x.pct_change())
+
+                # Calculate 20-day rolling volatility of daily returns
+                # min_periods=20 ensures that we only get a value if there are 20 data points,
+                # effectively making volatility NaN for initial periods with insufficient data.
+                vol_series = self.stock_data_df.groupby(level='Ticker', group_keys=False)['DailyReturn'].apply(lambda x: x.rolling(window=20, min_periods=20).std())
+                self.stock_data_df['Volatility_20d'] = vol_series
+                
+                # Note: 'DailyReturn' will have NaN for the first entry of each stock.
+                # 'Volatility_20d' will have NaNs for the first 19 (actual data) entries of each stock.
+                # These NaNs are expected and will be handled during target calculation in the worker.
+            else:
+                # If stock_data_df is empty, create empty columns to prevent KeyErrors later
+                # if other parts of the code expect these columns to exist.
+                self.stock_data_df['DailyReturn'] = pd.Series(dtype=float)
+                self.stock_data_df['Volatility_20d'] = pd.Series(dtype=float)
+            # --- END: New code for target variable calculation prerequisites ---
 
         except FileNotFoundError:
             print(f"ERROR: Stock data CSV file not found at {self.root_csv_path}")
@@ -373,6 +488,24 @@ class MyDataset(Dataset):
         return torch.stack(entropy_list)
 
     def adjacency_matrix(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates the adjacency matrix based on information entropy and signal energy,
+        as per Section 4.1 of the MGDPR paper.
+        (a_{t,r})_{i,j} = (E(x_{t,r,i}) / E(x_{t,r,j})) * exp(H(x_{t,r,i}) - H(x_{t,r,j}))
+        
+        Note: The original implementation in the demo notebook included a log transformation
+        after this calculation (A[A<1]=1 then log(A)). This has been removed to align
+        strictly with the paper's formula.
+
+        Args:
+            X (torch.Tensor): Input node features for a single relation (feature type)
+                              over the lookback window.
+                              Shape: (num_companies, window_size_features).
+        
+        Returns:
+            torch.Tensor: Calculated adjacency matrix for the given relation.
+                          Shape: (num_companies, num_companies).
+        """
         if X.ndim != 2:
             raise ValueError(f"Input X to adjacency_matrix must be 2D (num_companies, num_features_per_company). Got shape {X.shape}")
         num_companies = X.shape[0]
@@ -392,19 +525,7 @@ class MyDataset(Dataset):
         A_calculated_values = energy_ratio * exp_entropy_diff
         A = torch.where(zero_energy_j_mask.expand_as(A), torch.zeros_like(A), A_calculated_values)
         
-        # Re-introducing transformations similar to demo notebook: A[A<1]=1 then log(A)
-        # Using a small epsilon for numerical stability with log and the lower bound.
-        epsilon = 1e-9
-        # Condition for values between epsilon and 1.0
-        condition_A_lt_1_and_gt_epsilon = (A < 1.0) & (A > epsilon)
-        A = torch.where(condition_A_lt_1_and_gt_epsilon, torch.ones_like(A), A)
-        
-        # Ensure A is not zero before log to prevent -inf, though adding epsilon handles most cases.
-        # If A could become exactly 0 after the above step (e.g. if original A_calculated_values was 0 and not caught by zero_energy_j_mask)
-        # and then not part of condition_A_lt_1_and_gt_epsilon, it would remain 0.
-        # Adding epsilon inside log is safer.
-        A_final = torch.log(A + epsilon)
-        return A_final
+        return A
 
     def node_feature_matrix(self, window_dates_str: List[str], comlist_arg: List[str], market: str) -> torch.Tensor: # Renamed comlist to comlist_arg
         num_features = 5
