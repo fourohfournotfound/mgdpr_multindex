@@ -12,6 +12,7 @@ from datetime import datetime, timedelta # Added import
 import torch.nn.functional as F
 import pandas as pd # Added for MultiIndex DataFrame
 import numpy as np # Added for np.isnan
+from sklearn.preprocessing import StandardScaler # Added for global feature scaling
 # import torch.distributions # Not explicitly used in the notebook's training script part
 from sklearn.metrics import matthews_corrcoef, f1_score, ndcg_score
 from scipy.stats import spearmanr
@@ -49,7 +50,7 @@ args = parser.parse_args()
 # Date ranges for training, validation, and testing
 # TODO: IMPORTANT - Update these date ranges to match your dataset's actual time coverage!
 # Example: If your data is from 2018 to 2023
-train_sedate = ['2018-01-01', '2021-12-31'] # Replace with your actual training start and end dates
+train_sedate = ['2019-01-01', '2021-12-31'] # Replace with your actual training start and end dates
 val_sedate = ['2022-01-01', '2022-12-31']   # Replace with your actual validation start and end dates
 test_sedate = ['2023-01-01', '2023-12-31']  # Replace with your actual test start and end dates
 
@@ -72,7 +73,7 @@ com_list_csv_paths = [
 # Root directory for individual stock data CSVs (e.g., market_ticker_30Y.csv)
 # MyDataset expects files like: os.path.join(root_data_dir, f'{market}_{ticker}_30Y.csv')
 # TODO: Update this path to your local raw stock data CSV file
-root_data_dir = "/workspaces/ai_testground/shortlist_stocks-1.csv" # Path to the single stock data CSV file
+root_data_dir = "/workspaces/ai_testground/2_4_25_random_fundamentals_options_filtered_and_aligned.csv" # Path to the single stock data CSV file
 
 # Destination directory for generated graph .pt files
 # MyDataset will create subfolders like: os.path.join(graph_dest_dir, f'{market}_{type}_{start}_{end}_{window}')
@@ -220,15 +221,59 @@ if not os.path.exists(root_data_dir):
 # Parameters: root, desti, market, comlist, start, end, window, dataset_type
 window_size = 19 # As per notebook
 
-print("Initializing training dataset...")
+# --- Scaler Fitting ---
+print("Preparing to fit StandardScaler on training data features...")
+# Create a temporary dataset instance for the training period to access its loaded and processed stock_data_df
+# This dataset instance itself won't be used for training, only for fitting the scaler.
+# No scaler is passed to it.
+temp_train_dataset_for_scaler = MyDataset(root_data_dir, graph_dest_dir, current_market, target_com_list,
+                                          train_sedate[0], train_sedate[1], window_size, "ScalerFitTemp")
+
+# Access the stock_data_df which is indexed by ('Ticker', 'Date')
+# and contains 'Open', 'High', 'Low', 'Close', 'Volume' columns.
+df_for_scaling = temp_train_dataset_for_scaler.stock_data_df.copy()
+
+# Filter for the exact training period and tickers (though MyDataset's internal df should already be filtered by comlist)
+# The date filtering here is to ensure we only use the specified training date range.
+# MyDataset's find_dates and internal logic already handle date filtering for graph generation,
+# but for scaler fitting, we explicitly use the train_sedate range on its fully loaded df.
+train_start_dt = pd.to_datetime(train_sedate[0])
+train_end_dt = pd.to_datetime(train_sedate[1])
+
+# Get dates from the index that fall within the training period
+dates_in_df = df_for_scaling.index.get_level_values('Date')
+df_for_scaling_train_period = df_for_scaling[(dates_in_df >= train_start_dt) & (dates_in_df <= train_end_dt)]
+
+if df_for_scaling_train_period.empty:
+    print("WARNING: No data found in the training period to fit the scaler. Global scaling will not be applied.")
+    fitted_scaler = None
+else:
+    features_to_scale_columns = ['Open', 'High', 'Low', 'Close', 'Volume'] # These are the 5 features
+    training_features_np = df_for_scaling_train_period[features_to_scale_columns].values
+
+    if training_features_np.size == 0:
+        print("WARNING: Extracted training features for scaling are empty. Global scaling will not be applied.")
+        fitted_scaler = None
+    else:
+        # Apply log1p transformation, similar to how it's done per window before scaling
+        log1p_training_features_np = np.log1p(training_features_np)
+        
+        # Initialize and fit the StandardScaler
+        scaler = StandardScaler()
+        scaler.fit(log1p_training_features_np)
+        fitted_scaler = scaler
+        print("StandardScaler fitted on log1p-transformed training data features.")
+
+# --- Main Dataset Instantiation (passing the fitted_scaler) ---
+print("Initializing training dataset with scaler...")
 train_dataset = MyDataset(root_data_dir, graph_dest_dir, current_market, target_com_list,
-                          train_sedate[0], train_sedate[1], window_size, dataset_types[0])
-print("Initializing validation dataset...")
+                          train_sedate[0], train_sedate[1], window_size, dataset_types[0], scaler=fitted_scaler)
+print("Initializing validation dataset with scaler...")
 validation_dataset = MyDataset(root_data_dir, graph_dest_dir, current_market, target_com_list,
-                               val_sedate[0], val_sedate[1], window_size, dataset_types[1])
-print("Initializing test dataset...")
+                               val_sedate[0], val_sedate[1], window_size, dataset_types[1], scaler=fitted_scaler)
+print("Initializing test dataset with scaler...")
 test_dataset = MyDataset(root_data_dir, graph_dest_dir, current_market, target_com_list,
-                         test_sedate[0], test_sedate[1], window_size, dataset_types[2])
+                         test_sedate[0], test_sedate[1], window_size, dataset_types[2], scaler=fitted_scaler)
 
 # --- DataLoader Instantiation ---
 # Wrap datasets with DataLoader for batching, shuffling, and parallel loading.

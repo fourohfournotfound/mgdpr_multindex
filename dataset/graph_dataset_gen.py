@@ -111,6 +111,26 @@ def _mp_worker_graph_generation_task(
             # Add a small epsilon to std to prevent division by zero if a feature is constant
             # X_processed[k_feature_idx] = (X_processed[k_feature_idx] - mean) / (std + 1e-9)
 
+        # Apply global scaling if scaler is provided
+        if my_dataset_instance.scaler is not None:
+            # X_processed has shape (num_total_features, num_companies, window_size)
+            # We scale the first 'feature_dim' (e.g., 5 for O,H,L,C,V)
+            num_main_features_to_scale = my_dataset_instance.feature_dim
+            if X_processed.shape[0] >= num_main_features_to_scale:
+                features_slice_to_scale = X_processed[:num_main_features_to_scale, :, :].clone() # (feature_dim, num_comp, window)
+                original_slice_shape = features_slice_to_scale.shape
+                
+                # Transpose to (num_comp, window, feature_dim) then reshape to (num_comp*window, feature_dim)
+                # This matches the shape scaler was fit on (samples, features)
+                features_2d = features_slice_to_scale.permute(1, 2, 0).reshape(-1, num_main_features_to_scale)
+                
+                features_2d_np = features_2d.cpu().numpy()
+                scaled_features_2d_np = my_dataset_instance.scaler.transform(features_2d_np)
+                scaled_features_2d_torch = torch.tensor(scaled_features_2d_np, dtype=torch.float32, device=X_processed.device)
+                
+                # Reshape back to (num_comp, window, feature_dim) then permute to (feature_dim, num_comp, window)
+                X_processed[:num_main_features_to_scale, :, :] = scaled_features_2d_torch.reshape(original_slice_shape[1], original_slice_shape[2], num_main_features_to_scale).permute(2, 0, 1)
+
         A_adj = torch.zeros((X_processed.shape[0], X_processed.shape[1], X_processed.shape[1]))
         for l_feature_idx in range(A_adj.shape[0]):
             A_adj[l_feature_idx] = my_dataset_instance.adjacency_matrix(X_processed[l_feature_idx])
@@ -156,7 +176,7 @@ class MyDataset(Dataset):
     
     The dataset uses multiprocessing for efficient graph generation if files are missing or incomplete.
     """
-    def __init__(self, root_csv_path: str, desti: str, market: str, comlist: List[str], start: str, end: str, window: int, dataset_type: str):
+    def __init__(self, root_csv_path: str, desti: str, market: str, comlist: List[str], start: str, end: str, window: int, dataset_type: str, scaler=None):
         """
         Initializes the dataset, loads stock data, and triggers graph generation if needed.
 
@@ -172,6 +192,7 @@ class MyDataset(Dataset):
             end (str): End date string for the dataset period (YYYY-MM-DD).
             window (int): Lookback window size (tau in paper) for constructing graph features.
             dataset_type (str): Type of dataset (e.g., "Train", "Validation", "Test"). Used for naming.
+            scaler (sklearn.preprocessing.StandardScaler, optional): Fitted scaler for features. Defaults to None.
         """
         print("--- DEBUG: MyDataset __init__ ENTERED ---") # Very simple debug print
         super().__init__()
@@ -180,10 +201,12 @@ class MyDataset(Dataset):
         self.market = market
         self.root_csv_path = root_csv_path
         self.desti = desti
-        self.start_str = start 
-        self.end_str = end     
+        self.start_str = start
+        self.end_str = end
         self.window = window
-        self.dataset_type = dataset_type 
+        self.dataset_type = dataset_type
+        self.scaler = scaler
+        self.feature_dim = 5 # Number of primary features (O,H,L,C,V) to be scaled
         
         # Load the CSV and prepare the MultiIndex DataFrame
         try:
