@@ -558,6 +558,28 @@ class MGDPR(nn.Module):
         # Output: (Batch_Size, Num_Nodes, Num_Classes)
         return current_rep_for_mlp
 
+    def get_theta_regularization_loss(self):
+        """
+        Calculates the regularization loss for the theta parameters.
+        The loss is sum_{l,r} | (sum_k theta_{l,r,k}) - 1 |.
+        This encourages the sum of raw theta weights (before softmax in MultiReDiffusion)
+        for each layer and relation over the expansion steps to be close to 1.
+        """
+        if not hasattr(self, 'theta') or self.theta is None:
+            return torch.tensor(0.0, device=self.T.device if hasattr(self, 'T') else 'cpu') # Return 0 if theta is not defined
+
+        # self.theta has shape (layers, num_relation, expansion_steps)
+        # Sum theta over expansion_steps (dim=2)
+        sum_over_k = torch.sum(self.theta, dim=2) # Shape: (layers, num_relation)
+        
+        # Calculate |sum_k theta_{l,r,k} - 1|
+        abs_diff_from_one = torch.abs(sum_over_k - 1.0)
+        
+        # Sum these absolute differences over all layers and relations
+        total_reg_loss = torch.sum(abs_diff_from_one)
+        
+        return total_reg_loss
+
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.T)
         nn.init.xavier_uniform_(self.theta)

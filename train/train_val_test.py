@@ -425,11 +425,6 @@ model = MGDPR(actual_diffusion_config, retention_config, ret_linear_1_config, re
 model = model.to(device)
 
 # --- Optimizer and Objective Function ---
-def theta_regularizer(theta_param): # Renamed to avoid conflict
-    row_sums = torch.sum(theta_param.to(device), dim=-1)
-    ones = torch.ones_like(row_sums)
-    return torch.sum(torch.abs(row_sums - ones))
-
 optimizer = torch.optim.AdamW(model.parameters(), lr=2.5e-4) # Reverted to paper's learning rate
 # criterion = F.cross_entropy # Using criterion directly # Replaced by ListNetLoss
 
@@ -582,12 +577,23 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
             valid_pred_scores = out_predicted_scores[sample_has_valid_target]
             valid_true_scores = C_target_scores[sample_has_valid_target]
             
-            current_loss = criterion(valid_pred_scores, valid_true_scores)
-            loss = current_loss
+            listfold_loss = criterion(valid_pred_scores, valid_true_scores)
+            
+            # Add theta regularization loss
+            theta_reg_loss = model.get_theta_regularization_loss()
+            
+            # The regularization_gamma is already defined in the script (e.g., 2.5e-4)
+            # It's accessible via model.regularization_gamma if it was stored there,
+            # or directly if it's in the global scope of train_val_test.py.
+            # Assuming `regularization_gamma` is accessible here.
+            # If not, it should be passed to train_batch or accessed via model.
+            # The MGDPR model stores it as self.regularization_gamma.
+            
+            if model.regularization_gamma is not None:
+                loss = listfold_loss + model.regularization_gamma * theta_reg_loss
+            else:
+                loss = listfold_loss # No regularization if gamma is None
         
-        # Theta regularizer (if re-enabled, ensure it's compatible with the new loss structure)
-        # For now, keeping it disabled as per the original script's effective state.
-        # The debug print using 'i' and 'train_loader' was removed as it's out of scope here.
     # <<< End of torch.amp.autocast block >>>
 
     # Backward pass and optimization
@@ -621,7 +627,7 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
 
     return loss, out_predicted_scores, C_target_scores, sample_has_valid_target
 
-epochs = 2 # Reduced for quick testing, notebook uses 10000
+epochs = 10 # Reduced for quick testing, notebook uses 10000
 model.reset_parameters()
 
 # --- AMP Scaler ---
