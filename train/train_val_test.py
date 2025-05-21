@@ -433,47 +433,87 @@ def theta_regularizer(theta_param): # Renamed to avoid conflict
 optimizer = torch.optim.AdamW(model.parameters(), lr=2.5e-4) # Reverted to paper's learning rate
 # criterion = F.cross_entropy # Using criterion directly # Replaced by ListNetLoss
 
-# --- Custom ListNet-style Loss Function ---
-class ListNetLoss(torch.nn.Module):
-    def __init__(self):
-        super(ListNetLoss, self).__init__()
-        # KLDivLoss expects log-probabilities for the input and probabilities for the target.
-        # reduction='batchmean' means the sum of losses for each sample in the batch is divided by batch_size.
-        self.kl_div_loss = torch.nn.KLDivLoss(reduction='batchmean', log_target=False) # log_target=False is default
+# --- Custom ListFold Exponential Loss Function ---
+class ListFoldExponentialLoss(torch.nn.Module):
+    def __init__(self, epsilon=1e-9):
+        super(ListFoldExponentialLoss, self).__init__()
+        self.epsilon = epsilon
 
-    def forward(self, y_pred_scores, y_true_scores):
+    def forward(self, y_pred_scores_batch, y_true_scores_batch):
         """
-        Calculates ListNet loss.
+        Calculates ListFold loss with exponential transformation.
         Args:
-            y_pred_scores (torch.Tensor): Predicted scores from the model.
-                                          Shape: (Batch_Size, Num_Nodes_in_List)
-            y_true_scores (torch.Tensor): True target scores (e.g., z-scored vol-adjusted returns).
-                                          Shape: (Batch_Size, Num_Nodes_in_List)
+            y_pred_scores_batch (torch.Tensor): Predicted scores from the model.
+                                          Shape: (Batch_Size, Num_Nodes)
+            y_true_scores_batch (torch.Tensor): True target scores.
+                                          Shape: (Batch_Size, Num_Nodes)
                                           May contain NaNs for items that are not valid targets.
         Returns:
-            torch.Tensor: The ListNet loss value.
+            torch.Tensor: The ListFold exponential loss value.
         """
-        # Handle NaNs in y_true_scores for softmax calculation
-        # Replace NaNs with a very small number so they get near-zero probability
-        y_true_for_softmax = torch.where(torch.isnan(y_true_scores), torch.full_like(y_true_scores, -1e9), y_true_scores)
-        
-        # Create target probabilities P_true
-        # Softmax over the list of items (Num_Nodes_in_List dimension)
-        p_true = F.softmax(y_true_for_softmax, dim=1)
+        batch_total_loss = 0.0
+        actual_samples_in_batch = 0
 
-        # Create predicted probabilities P_pred (as log-probabilities for KLDivLoss)
-        # Softmax over the list of items
-        log_p_pred = F.log_softmax(y_pred_scores, dim=1)
-        
-        # KLDivLoss: sum(p_true * (log(p_true) - log_p_pred))
-        # Since log_target=False, it computes sum(p_true * (log(p_true) - log_p_pred)) if p_true is passed.
-        # However, the standard KLDivLoss(log_input, target) is sum(target * (log(target) - log_input)).
-        # We provide log_p_pred as input and p_true as target.
-        loss = self.kl_div_loss(log_p_pred, p_true)
-        
-        return loss
+        for k_batch in range(y_pred_scores_batch.size(0)):
+            y_pred_sample = y_pred_scores_batch[k_batch]
+            y_true_sample = y_true_scores_batch[k_batch]
 
-criterion = ListNetLoss()
+            # Filter out NaNs based on y_true_sample
+            valid_mask = ~torch.isnan(y_true_sample)
+            s_true_valid = y_true_sample[valid_mask]
+            s_pred_valid = y_pred_sample[valid_mask]
+
+            N_valid = s_true_valid.size(0)
+
+            if N_valid < 2:  # Need at least one pair
+                continue
+
+            num_pairs = N_valid // 2
+            if num_pairs == 0:
+                continue
+            
+            actual_samples_in_batch += 1
+
+            # Get true permutation indices (for s_true_valid, descending)
+            perm_indices = torch.argsort(s_true_valid, descending=True)
+            
+            # Predicted scores sorted according to true relevance
+            s_pred_sorted_by_true = s_pred_valid[perm_indices]
+
+            sample_loss_accumulator = 0.0
+            
+            for i_pair_idx in range(num_pairs):
+                score_pred_true_top = s_pred_sorted_by_true[i_pair_idx]
+                score_pred_true_bottom = s_pred_sorted_by_true[N_valid - 1 - i_pair_idx]
+                
+                numerator_term = score_pred_true_top - score_pred_true_bottom
+
+                current_remaining_scores_for_denom = s_pred_sorted_by_true[i_pair_idx : N_valid - i_pair_idx]
+                len_remaining = current_remaining_scores_for_denom.size(0)
+
+                if len_remaining < 2:
+                    break
+
+                exp_scores = torch.exp(current_remaining_scores_for_denom)
+                exp_neg_scores = torch.exp(-current_remaining_scores_for_denom)
+                
+                sum_exp_scores = torch.sum(exp_scores)
+                sum_exp_neg_scores = torch.sum(exp_neg_scores)
+                
+                denominator_sum_exp_terms = sum_exp_scores * sum_exp_neg_scores - len_remaining
+                
+                denominator_term = torch.log(denominator_sum_exp_terms + self.epsilon)
+
+                sample_loss_accumulator -= (numerator_term - denominator_term)
+            
+            batch_total_loss += sample_loss_accumulator
+
+        if actual_samples_in_batch > 0:
+            return batch_total_loss / actual_samples_in_batch
+        else:
+            return torch.tensor(0.0, device=y_pred_scores_batch.device, requires_grad=True)
+
+criterion = ListFoldExponentialLoss()
 # --- Training, Validation, and Testing ---
 # --- Profiler Configuration (from parsed arguments) ---
 PROFILE_ENABLED = args.profile
@@ -581,7 +621,7 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
 
     return loss, out_predicted_scores, C_target_scores, sample_has_valid_target
 
-epochs = 10 # Reduced for quick testing, notebook uses 10000
+epochs = 2 # Reduced for quick testing, notebook uses 10000
 model.reset_parameters()
 
 # --- AMP Scaler ---
@@ -771,7 +811,7 @@ for epoch in range(epochs):
     # TODO: Update validation to use ranking metrics instead of classification metrics.
     
     # Define ndcg_k_values here so it's accessible in both validation and test loops
-    ndcg_k_values = [1, 10] # Define k values for NDCG
+    ndcg_k_values = [2, 10] # Define k values for NDCG
 
     if (epoch + 1) % 5 == 0 and len(val_loader) > 0:
         model.eval()
@@ -812,7 +852,7 @@ for epoch in range(epochs):
         avg_val_loss = val_loss_sum / num_val_batches if num_val_batches > 0 else 0
         
         # Calculate and print ranking metrics
-        ndcg_k_values = [5, 10] # Define k values for NDCG
+        ndcg_k_values = [2, 10] # Define k values for NDCG
         epoch_ndcg_scores = {k: [] for k in ndcg_k_values}
         epoch_spearman_coeffs = []
 
