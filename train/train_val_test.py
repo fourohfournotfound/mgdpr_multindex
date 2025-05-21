@@ -69,7 +69,7 @@ com_list_csv_paths = [
 # Root directory for individual stock data CSVs (e.g., market_ticker_30Y.csv)
 # MyDataset expects files like: os.path.join(root_data_dir, f'{market}_{ticker}_30Y.csv')
 # TODO: Update this path to your local raw stock data CSV file
-root_data_dir = "/workspaces/ai_testground/05_06_25_sp50_fundamentals_options_filtered_and_aligned.csv" # Path to the single stock data CSV file
+root_data_dir = "/workspaces/ai_testground/05_06_25_sectoretf_filtered_and_aligned.csv" # Path to the single stock data CSV file
 
 # Destination directory for generated graph .pt files
 # MyDataset will create subfolders like: os.path.join(graph_dest_dir, f'{market}_{type}_{start}_{end}_{window}')
@@ -484,11 +484,13 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
         for l_idx in range(model.layers): # model.layers was d_layers in train script
             reg_loss += theta_regularizer(model.theta[l_idx])
         
-        reg_lambda = 0.01 # Introduce regularization strength
-        scaled_reg_loss = reg_lambda * reg_loss
-        loss = ce_loss + scaled_reg_loss # Add scaled regularization to the loss
+        # reg_lambda = 0.01 # Introduce regularization strength
+        # scaled_reg_loss = reg_lambda * reg_loss
+        # loss = ce_loss + scaled_reg_loss # Add scaled regularization to the loss
+        loss = ce_loss # Using only CE Loss, as theta_regularizer is commented out in demo notebook
         if i % 10 == 0 or i == len(train_loader) -1 : # Print components periodically
-            print(f"DEBUG Batch {i+1}: CE Loss: {ce_loss.item():.4f}, Reg Loss (unscaled): {reg_loss.item():.4f}, Scaled Reg Loss: {scaled_reg_loss.item():.4f}, Total Loss: {loss.item():.4f}")
+            # print(f"DEBUG Batch {i+1}: CE Loss: {ce_loss.item():.4f}, Reg Loss (unscaled): {reg_loss.item():.4f}, Scaled Reg Loss: {scaled_reg_loss.item():.4f}, Total Loss: {loss.item():.4f}")
+            print(f"DEBUG Batch {i+1}: CE Loss: {ce_loss.item():.4f}, Total Loss: {loss.item():.4f} (Theta Regularizer Disabled)")
     
     # Backward pass and optimization
     if use_amp:

@@ -61,12 +61,11 @@ def _mp_worker_graph_generation_task(
 
         for k_feature_idx in range(X_processed.shape[0]):
             X_processed[k_feature_idx] = torch.Tensor(np.log1p(X_processed[k_feature_idx].numpy()))
-            # Add Z-score normalization per feature, per company, across the window
-            # X_processed[k_feature_idx] is (num_companies, window_size)
-            mean = X_processed[k_feature_idx].mean(dim=1, keepdim=True)
-            std = X_processed[k_feature_idx].std(dim=1, keepdim=True)
+            # Z-score normalization removed to match demo notebook more closely for now
+            # mean = X_processed[k_feature_idx].mean(dim=1, keepdim=True)
+            # std = X_processed[k_feature_idx].std(dim=1, keepdim=True)
             # Add a small epsilon to std to prevent division by zero if a feature is constant
-            X_processed[k_feature_idx] = (X_processed[k_feature_idx] - mean) / (std + 1e-9)
+            # X_processed[k_feature_idx] = (X_processed[k_feature_idx] - mean) / (std + 1e-9)
 
         A_adj = torch.zeros((X_processed.shape[0], X_processed.shape[1], X_processed.shape[1]))
         for l_feature_idx in range(A_adj.shape[0]):
@@ -392,10 +391,20 @@ class MyDataset(Dataset):
         exp_entropy_diff = torch.exp(entropy_i - entropy_j)
         A_calculated_values = energy_ratio * exp_entropy_diff
         A = torch.where(zero_energy_j_mask.expand_as(A), torch.zeros_like(A), A_calculated_values)
-        # condition_A_lt_1_and_gt_0 = (A < 1.0) & (A > 1e-9) # Removed this line
-        # A = torch.where(condition_A_lt_1_and_gt_0, torch.ones_like(A), A) # Removed this line
-        # A_final = torch.log(A + 1e-9) # Removed log transformation for now to align with paper's (a_t,r)_ij
-        return A # Return A directly as per paper's formula for (a_t,r)_ij
+        
+        # Re-introducing transformations similar to demo notebook: A[A<1]=1 then log(A)
+        # Using a small epsilon for numerical stability with log and the lower bound.
+        epsilon = 1e-9
+        # Condition for values between epsilon and 1.0
+        condition_A_lt_1_and_gt_epsilon = (A < 1.0) & (A > epsilon)
+        A = torch.where(condition_A_lt_1_and_gt_epsilon, torch.ones_like(A), A)
+        
+        # Ensure A is not zero before log to prevent -inf, though adding epsilon handles most cases.
+        # If A could become exactly 0 after the above step (e.g. if original A_calculated_values was 0 and not caught by zero_energy_j_mask)
+        # and then not part of condition_A_lt_1_and_gt_epsilon, it would remain 0.
+        # Adding epsilon inside log is safer.
+        A_final = torch.log(A + epsilon)
+        return A_final
 
     def node_feature_matrix(self, window_dates_str: List[str], comlist_arg: List[str], market: str) -> torch.Tensor: # Renamed comlist to comlist_arg
         num_features = 5
