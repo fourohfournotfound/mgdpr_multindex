@@ -31,8 +31,16 @@ class MultiReDiffusion(torch.nn.Module):
         # 1. Calculate diffusion_mats_batched
         # theta_param: (R, E) -> reshape to (1, R, E, 1, 1) for broadcasting
         theta_p_exp = theta_param.unsqueeze(0).unsqueeze(3).unsqueeze(4)
-        # t_param: (R, E, N, N) -> reshape to (1, R, E, N, N) for broadcasting
-        t_p_exp = t_param.unsqueeze(0)
+        
+        # Normalize t_param along the node dimension (dim=2 of t_param, which is N_source for M_ij)
+        # t_param original shape: (R, E, N_target, N_source)
+        # We want to softmax over N_source, so dim=3 (or -1)
+        t_param_normalized = torch.softmax(t_param, dim=3) # Paper: column-stochastic, sum over j M_ij = 1
+                                                          # If t_param is (R,E,N,N) as M_target_source, softmax over source (dim 3)
+
+        # t_param_normalized: (R, E, N, N) -> reshape to (1, R, E, N, N) for broadcasting
+        t_p_exp = t_param_normalized.unsqueeze(0)
+        
         # a_input_batched: (B, R, N, N) -> reshape to (B, R, 1, N, N) for broadcasting
         a_in_b_exp = a_input_batched.unsqueeze(2)
 
