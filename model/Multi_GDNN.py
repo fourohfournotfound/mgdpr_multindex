@@ -315,8 +315,12 @@ class ParallelRetention(torch.nn.Module):
             term_before_matmul_v = current_d_gamma * inter_feat_sample
             if torch.isinf(term_before_matmul_v).any() or torch.isnan(term_before_matmul_v).any(): print(f"DEBUG AMP: (current_d_gamma * inter_feat_sample) has NaN/Inf at b_idx {b_idx}")
 
-            retained_x_sample = torch.matmul(term_before_matmul_v, v_sample) # (time_dim, inter_dim)
-            if torch.isinf(retained_x_sample).any() or torch.isnan(retained_x_sample).any(): print(f"DEBUG AMP: retained_x_sample (after matmul with V) has NaN/Inf at b_idx {b_idx}")
+            # Perform (D * QK^T) @ V matmul in FP32 for stability with AMP
+            term_before_matmul_v_fp32 = term_before_matmul_v.float()
+            v_sample_fp32 = v_sample.float()
+            retained_x_sample_fp32 = torch.matmul(term_before_matmul_v_fp32, v_sample_fp32)
+            retained_x_sample = retained_x_sample_fp32.to(term_before_matmul_v.dtype) # Cast back to original dtype
+            if torch.isinf(retained_x_sample).any() or torch.isnan(retained_x_sample).any(): print(f"DEBUG AMP: retained_x_sample (after matmul with V, FP32 matmul) has NaN/Inf at b_idx {b_idx}")
             
             # Apply Group Normalization (phi function from paper)
             if self.inter_dim > 0: # Apply only if inter_dim is valid for GroupNorm
