@@ -294,33 +294,25 @@ class ParallelRetention(torch.nn.Module):
                                    f"x_sample shape: {x_sample.shape}, target view: ({self.time_dim}, {self.in_dim}). "
                                    f"Original error: {e}")
 
-            q_sample = self.Q_layers(x_reshaped_sample) # (time_dim, inter_dim)
-            if torch.isinf(q_sample).any() or torch.isnan(q_sample).any(): print(f"DEBUG AMP: q_sample has NaN/Inf at b_idx {b_idx}")
-            k_sample = self.K_layers(x_reshaped_sample) # (time_dim, inter_dim)
-            if torch.isinf(k_sample).any() or torch.isnan(k_sample).any(): print(f"DEBUG AMP: k_sample has NaN/Inf at b_idx {b_idx}")
-            v_sample = self.V_layers(x_reshaped_sample) # (time_dim, inter_dim)
-            if torch.isinf(v_sample).any() or torch.isnan(v_sample).any(): print(f"DEBUG AMP: v_sample has NaN/Inf at b_idx {b_idx}")
+            # Perform all critical operations in FP32 for numerical stability with AMP
+            x_reshaped_sample_fp32 = x_reshaped_sample.float()
+            
+            q_sample_fp32 = self.Q_layers(x_reshaped_sample_fp32) # (time_dim, inter_dim) in FP32
+            k_sample_fp32 = self.K_layers(x_reshaped_sample_fp32) # (time_dim, inter_dim) in FP32
+            v_sample_fp32 = self.V_layers(x_reshaped_sample_fp32) # (time_dim, inter_dim) in FP32
 
-            # Perform QK^T matmul in FP32 for stability with AMP
-            q_fp32 = q_sample.float()
-            k_fp32 = k_sample.float()
-            inter_feat_sample_fp32 = torch.matmul(q_fp32, k_fp32.transpose(0, 1))
-            inter_feat_sample = inter_feat_sample_fp32.to(q_sample.dtype) # Cast back to original dtype (e.g., x_reshaped_sample.dtype or q_sample.dtype)
-            if torch.isinf(inter_feat_sample).any() or torch.isnan(inter_feat_sample).any(): print(f"DEBUG AMP: inter_feat_sample (after QK^T, FP32 matmul) has NaN/Inf at b_idx {b_idx}")
+            inter_feat_sample_fp32 = torch.matmul(q_sample_fp32, k_sample_fp32.transpose(0, 1)) # (time_dim, time_dim) in FP32
             
             current_d_gamma = d_gamma_batched if d_gamma_batched.dim() == 2 else d_gamma_batched[b_idx]
-            if torch.isinf(current_d_gamma).any() or torch.isnan(current_d_gamma).any(): print(f"DEBUG AMP: current_d_gamma has NaN/Inf at b_idx {b_idx}")
+            current_d_gamma_fp32 = current_d_gamma.float()
 
-            # Check current_d_gamma * inter_feat_sample before matmul with v_sample
-            term_before_matmul_v = current_d_gamma * inter_feat_sample
-            if torch.isinf(term_before_matmul_v).any() or torch.isnan(term_before_matmul_v).any(): print(f"DEBUG AMP: (current_d_gamma * inter_feat_sample) has NaN/Inf at b_idx {b_idx}")
-
-            # Perform (D * QK^T) @ V matmul in FP32 for stability with AMP
-            term_before_matmul_v_fp32 = term_before_matmul_v.float()
-            v_sample_fp32 = v_sample.float()
-            retained_x_sample_fp32 = torch.matmul(term_before_matmul_v_fp32, v_sample_fp32)
-            retained_x_sample = retained_x_sample_fp32.to(term_before_matmul_v.dtype) # Cast back to original dtype
-            if torch.isinf(retained_x_sample).any() or torch.isnan(retained_x_sample).any(): print(f"DEBUG AMP: retained_x_sample (after matmul with V, FP32 matmul) has NaN/Inf at b_idx {b_idx}")
+            # Perform (D * QK^T) @ V in FP32
+            term_before_matmul_v_fp32 = current_d_gamma_fp32 * inter_feat_sample_fp32
+            retained_x_sample_fp32 = torch.matmul(term_before_matmul_v_fp32, v_sample_fp32) # (time_dim, inter_dim) in FP32
+            
+            # Cast back to original dtype only at the end
+            retained_x_sample = retained_x_sample_fp32.to(x_reshaped_sample.dtype)
+            if torch.isinf(retained_x_sample).any() or torch.isnan(retained_x_sample).any(): print(f"DEBUG AMP: retained_x_sample (all FP32 computation) has NaN/Inf at b_idx {b_idx}")
             
             # Apply Group Normalization (phi function from paper)
             if self.inter_dim > 0: # Apply only if inter_dim is valid for GroupNorm
