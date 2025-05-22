@@ -301,8 +301,12 @@ class ParallelRetention(torch.nn.Module):
             v_sample = self.V_layers(x_reshaped_sample) # (time_dim, inter_dim)
             if torch.isinf(v_sample).any() or torch.isnan(v_sample).any(): print(f"DEBUG AMP: v_sample has NaN/Inf at b_idx {b_idx}")
 
-            inter_feat_sample = torch.matmul(q_sample, k_sample.transpose(0, 1)) # (time_dim, time_dim)
-            if torch.isinf(inter_feat_sample).any() or torch.isnan(inter_feat_sample).any(): print(f"DEBUG AMP: inter_feat_sample has NaN/Inf at b_idx {b_idx}")
+            # Perform QK^T matmul in FP32 for stability with AMP
+            q_fp32 = q_sample.float()
+            k_fp32 = k_sample.float()
+            inter_feat_sample_fp32 = torch.matmul(q_fp32, k_fp32.transpose(0, 1))
+            inter_feat_sample = inter_feat_sample_fp32.to(q_sample.dtype) # Cast back to original dtype (e.g., x_reshaped_sample.dtype or q_sample.dtype)
+            if torch.isinf(inter_feat_sample).any() or torch.isnan(inter_feat_sample).any(): print(f"DEBUG AMP: inter_feat_sample (after QK^T, FP32 matmul) has NaN/Inf at b_idx {b_idx}")
             
             current_d_gamma = d_gamma_batched if d_gamma_batched.dim() == 2 else d_gamma_batched[b_idx]
             if torch.isinf(current_d_gamma).any() or torch.isnan(current_d_gamma).any(): print(f"DEBUG AMP: current_d_gamma has NaN/Inf at b_idx {b_idx}")
