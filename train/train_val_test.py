@@ -310,7 +310,7 @@ if num_companies == 0:
 model_feature_len = window_size # This is the actual length of the feature vector per node/relation from X
 # d_layers, num_relation, m_gamma, diffusion_steps = 6, 5, 2.5e-4, 7 # Old line
 d_layers, num_relation, regularization_gamma, diffusion_steps = 5, 5, 2.5e-4, 7 # Renamed m_gamma, Set d_layers to 5
-retention_decay_zeta = 1.27 # Changed to paper's specified value
+retention_decay_zeta = 0.9 # Using a proper decay value (0 < zeta < 1) as per troubleshooting.md and RetNet principles
 
 # Note: `gamma` in notebook was 2.5e-4, renamed to regularization_gamma.
 # The MGDPR model's `time_dim` parameter (for D_gamma, ParallelRetention) should be model_feature_len.
