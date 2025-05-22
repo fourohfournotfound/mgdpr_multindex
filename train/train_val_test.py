@@ -676,7 +676,7 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
 
     return loss, out_predicted_scores, C_target_scores, sample_has_valid_target
 
-epochs = 2 # Reduced for quick testing, notebook uses 10000
+epochs = 10 # Reduced for quick testing, notebook uses 10000
 model.reset_parameters()
 
 # --- AMP Scaler ---

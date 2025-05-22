@@ -61,7 +61,7 @@ def _mp_worker_graph_generation_task(
                 # Access pre-calculated DailyReturn and Volatility_20d from the main DataFrame
                 # These are for the target_date_dt (t+1)
                 # DailyReturn at t+1 is (Close_t+1 - Close_t) / Close_t
-                # Volatility_20d at t+1 is std_dev of DailyReturns up to t+1 (using returns from t-18 to t+1)
+                # Volatility_20d for target_date_dt (t+1) is calculated using DailyReturns up to the previous day (t).
                 next_day_return = my_dataset_instance.stock_data_df.loc[(company_ticker, target_date_dt), 'DailyReturn']
                 volatility = my_dataset_instance.stock_data_df.loc[(company_ticker, target_date_dt), 'Volatility_20d']
 
@@ -319,11 +319,12 @@ class MyDataset(Dataset):
                 # Calculate 20-day rolling volatility of daily returns
                 # min_periods=20 ensures that we only get a value if there are 20 data points,
                 # effectively making volatility NaN for initial periods with insufficient data.
-                vol_series = self.stock_data_df.groupby(level='Ticker', group_keys=False)['DailyReturn'].apply(lambda x: x.rolling(window=20, min_periods=20).std())
+                # Shift(1) ensures that volatility for day t+1 is based on returns up to day t.
+                vol_series = self.stock_data_df.groupby(level='Ticker', group_keys=False)['DailyReturn'].apply(lambda x: x.rolling(window=20, min_periods=20).std().shift(1))
                 self.stock_data_df['Volatility_20d'] = vol_series
                 
                 # Note: 'DailyReturn' will have NaN for the first entry of each stock.
-                # 'Volatility_20d' will have NaNs for the first 19 (actual data) entries of each stock.
+                # 'Volatility_20d' will have NaNs for the first 20 data entries of each stock (19 from rolling, 1 from shift).
                 # These NaNs are expected and will be handled during target calculation in the worker.
             else:
                 # If stock_data_df is empty, create empty columns to prevent KeyErrors later
