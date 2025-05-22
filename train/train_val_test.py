@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader # Added for DataLoader optimization
 
 from dataset.graph_dataset_gen import MyDataset # Corrected import
 from model.Multi_GDNN import MGDPR
+from utils.backtesting import run_backtest
 
 # Configure the device for running the model on GPU or CPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -675,7 +676,7 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
 
     return loss, out_predicted_scores, C_target_scores, sample_has_valid_target
 
-epochs = 10 # Reduced for quick testing, notebook uses 10000
+epochs = 2 # Reduced for quick testing, notebook uses 10000
 model.reset_parameters()
 
 # --- AMP Scaler ---
@@ -982,8 +983,13 @@ test_loss_sum = 0
 # test_mcc_scores = [] # Classification metric
 
 # Placeholder for ranking metrics
-all_test_pred_scores_list = []
-all_test_true_scores_list = []
+all_test_pred_scores_list = [] # For existing metrics calculation
+all_test_true_scores_list = [] # For existing metrics calculation
+
+# Lists for backtesting (flat lists of individual scores, dates, tickers)
+all_test_predictions_flat = []
+all_test_target_dates_flat = []
+all_test_tickers_flat = []
 
 
 if len(test_loader) == 0:
@@ -1010,8 +1016,97 @@ else:
                 test_loss = criterion(valid_test_pred_scores, valid_test_true_scores)
                 test_loss_sum += test_loss.item()
 
-            all_test_pred_scores_list.append(out_test_predicted_scores.cpu())
-            all_test_true_scores_list.append(C_test_target_scores.cpu())
+            all_test_pred_scores_list.append(out_test_predicted_scores.cpu()) # Keep for existing metrics
+            all_test_true_scores_list.append(C_test_target_scores.cpu())   # Keep for existing metrics
+
+            # Populate flat lists for backtesting
+            batch_pred_scores_cpu = out_test_predicted_scores.cpu() # Shape: (Batch, Nodes)
+            batch_true_scores_cpu = C_test_target_scores.cpu()   # Shape: (Batch, Nodes)
+
+            if i_test == 0: # Only for the first batch
+                print(f"DEBUG First Batch (i_test=0):")
+                if 'target_date_str' in test_sample:
+                    print(f"  test_sample['target_date_str'] (type: {type(test_sample['target_date_str'])}, len: {len(test_sample['target_date_str']) if isinstance(test_sample['target_date_str'], list) else 'N/A'}):")
+                    print(f"    {test_sample['target_date_str'][:5] if isinstance(test_sample['target_date_str'], list) else test_sample['target_date_str']}") # Print first 5 dates
+                else:
+                    print(f"  'target_date_str' NOT IN test_sample. Keys: {list(test_sample.keys())}")
+
+                if 'original_ticker_order' in test_sample:
+                    print(f"  test_sample['original_ticker_order'] (type: {type(test_sample['original_ticker_order'])}, len: {len(test_sample['original_ticker_order']) if isinstance(test_sample['original_ticker_order'], list) else 'N/A'}):")
+                    # For list of lists, print info about the first inner list
+                    if isinstance(test_sample['original_ticker_order'], list) and len(test_sample['original_ticker_order']) > 0 and isinstance(test_sample['original_ticker_order'][0], list):
+                        print(f"    First inner list len: {len(test_sample['original_ticker_order'][0])}, First 5 tickers: {test_sample['original_ticker_order'][0][:5]}")
+                    else:
+                        print(f"    {test_sample['original_ticker_order'][:5] if isinstance(test_sample['original_ticker_order'], list) else test_sample['original_ticker_order']}")
+                else:
+                    print(f"  'original_ticker_order' NOT IN test_sample. Keys: {list(test_sample.keys())}")
+
+            # --- Start: Debug and Robust Access for Backtest Data ---
+            if 'target_date_str' not in test_sample: # Only check for target_date_str now
+                print(f"DEBUG: Batch {i_test+1}: 'target_date_str' key MISSING from test_sample. Keys found: {list(test_sample.keys())}. Skipping batch for backtest data collection.")
+                continue
+
+            batch_target_dates = test_sample['target_date_str'] # Expected: list of date strings
+
+            if not isinstance(batch_target_dates, list):
+                print(f"DEBUG: Batch {i_test+1}: 'target_date_str' (type: {type(batch_target_dates)}) from DataLoader is not a list. Skipping batch for backtest data.")
+                continue
+            
+            # The list of tickers for any graph in this test_dataset is test_dataset.comlist
+            # which is available as `target_com_list` in this scope.
+            # The DataLoader's collation of 'original_ticker_order' was problematic.
+            # We know all graphs in this dataset instance share the same comlist.
+            tickers_for_all_graphs_in_dataset = target_com_list
+            if not isinstance(tickers_for_all_graphs_in_dataset, list):
+                 print(f"DEBUG: Batch {i_test+1}: target_com_list (used as tickers_for_all_graphs_in_dataset) is not a list. Type: {type(tickers_for_all_graphs_in_dataset)}. Skipping batch.")
+                 continue
+            # --- End: Debug and Robust Access ---
+
+            for i_sample_in_batch in range(batch_pred_scores_cpu.size(0)):
+                # Safety checks for list lengths against batch dimension
+                if i_sample_in_batch >= len(batch_target_dates): # Removed check for batch_tickers_list_of_lists length
+                    print(f"DEBUG: Batch {i_test+1}, Sample {i_sample_in_batch+1}: Mismatch in data lengths. "
+                          f"Preds batch size: {batch_pred_scores_cpu.size(0)}, "
+                          f"len(target_dates): {len(batch_target_dates)}. "
+                          f"Skipping sample for backtest.")
+                    continue
+
+                sample_date = batch_target_dates[i_sample_in_batch]
+                # Use the globally known comlist for this dataset instance
+                sample_tickers_for_graph = tickers_for_all_graphs_in_dataset
+                sample_pred_scores_for_graph = batch_pred_scores_cpu[i_sample_in_batch] # 1D tensor of predictions for the graph
+                sample_true_scores_for_graph = batch_true_scores_cpu[i_sample_in_batch] # 1D tensor of true scores for the graph
+
+                if not isinstance(sample_tickers_for_graph, list):
+                    print(f"DEBUG: Batch {i_test+1}, Sample {i_sample_in_batch+1}: sample_tickers_for_graph is not a list (type: {type(sample_tickers_for_graph)}). Skipping sample for backtest.")
+                    continue
+                
+                num_nodes_in_sample = len(sample_tickers_for_graph)
+
+                if num_nodes_in_sample == 0:
+                    # print(f"DEBUG: Batch {i_test+1}, Sample {i_sample_in_batch+1}: sample_tickers_for_graph is empty. Skipping sample for backtest.")
+                    continue
+
+                for i_node in range(num_nodes_in_sample):
+                    # Safety checks for node-level score tensor lengths against the number of tickers
+                    if i_node >= len(sample_pred_scores_for_graph) or \
+                       i_node >= len(sample_true_scores_for_graph):
+                        # This implies that the number of nodes in the graph (from X, A, Y tensors)
+                        # does not match len(sample_tickers_for_graph), which is self.comlist.
+                        # This should ideally not happen if graph generation uses self.comlist consistently.
+                        # For robustness, we skip if there's a mismatch.
+                        # print(f"DEBUG: Batch {i_test+1}, Sample {i_sample_in_batch+1}, Node {i_node}: Index out of bounds for scores. "
+                        #       f"Num tickers: {num_nodes_in_sample}, Pred scores len: {len(sample_pred_scores_for_graph)}. Skipping node.")
+                        continue # Skip this node
+                    
+                    # Only include if the true score is not NaN, indicating a valid stock for this sample/date
+                    if not np.isnan(sample_true_scores_for_graph[i_node].item()):
+                        current_ticker = sample_tickers_for_graph[i_node]
+                        # Explicitly skip PAD_TICKER or other placeholder tickers
+                        if current_ticker and str(current_ticker).strip().upper() not in ["PAD_TICKER", "PADDING", "NAN"]: # Add any other placeholder names
+                            all_test_target_dates_flat.append(sample_date)
+                            all_test_tickers_flat.append(current_ticker)
+                            all_test_predictions_flat.append(sample_pred_scores_for_graph[i_node].item())
 
     num_test_batches = len(test_loader)
     avg_test_loss = test_loss_sum / num_test_batches if num_test_batches > 0 else 0
@@ -1063,6 +1158,71 @@ else:
     avg_test_spearman_str = f"Spearman={np.mean(test_spearman_coeffs):.4f}" if test_spearman_coeffs else "Spearman=N/A"
 
     print(f"Test Results: Avg Loss={avg_test_loss:.4f}, {avg_test_ndcg_str}, {avg_test_spearman_str}")
+
+# --- Backtesting ---
+print("\n--- Running Backtests for Different N Tickers ---")
+# Ensure all necessary lists for backtesting are populated and test_dataset is available
+if all_test_predictions_flat and \
+   all_test_target_dates_flat and \
+   all_test_tickers_flat and \
+   'test_dataset' in locals() and test_dataset is not None:
+
+    num_tickers_to_trade_list = [1, 2, 3] # Default N values to test
+
+    for n_val in num_tickers_to_trade_list:
+        print(f"\nRunning backtest for N = {n_val} (Top {n_val} Long, Bottom {n_val} Short)...")
+        
+        # current_market should be defined globally (e.g., line 59)
+        backtest_plot_filename = f"mgdpr_{current_market.replace(' ', '_')}_N{n_val}_backtest_plot.png"
+        # The plot path is printed by plot_cumulative_returns within run_backtest,
+        # so no need to print it here again unless specifically desired.
+        # print(f"Backtest plot for N={n_val} will be saved to: {backtest_plot_filename}")
+
+        try:
+            sortino_ratios_dict = run_backtest(
+                all_predictions_list=all_test_predictions_flat,
+                all_target_dates_list=all_test_target_dates_flat,
+                all_tickers_list=all_test_tickers_flat,
+                test_dataset_instance=test_dataset,
+                output_plot_path=backtest_plot_filename,
+                risk_free_rate=0.0, # Default, can be made configurable if needed
+                num_tickers_to_trade=n_val
+            )
+            
+            long_only_sortino = sortino_ratios_dict.get('long_only', np.nan)
+            combined_strategy_sortino = sortino_ratios_dict.get('combined_strategy', np.nan)
+            benchmark_sortino = sortino_ratios_dict.get('benchmark', np.nan)
+
+            print(f"  N={n_val} Backtest Results:")
+            if not np.isnan(long_only_sortino):
+                print(f"    Sortino Ratio (Long Only): {long_only_sortino:.4f}")
+            else:
+                print(f"    Sortino Ratio (Long Only): NaN")
+            
+            if not np.isnan(combined_strategy_sortino):
+                print(f"    Sortino Ratio (Combined Strategy): {combined_strategy_sortino:.4f}")
+            else:
+                print(f"    Sortino Ratio (Combined Strategy): NaN")
+
+            if not np.isnan(benchmark_sortino):
+                print(f"    Sortino Ratio (Benchmark): {benchmark_sortino:.4f}")
+            else:
+                print(f"    Sortino Ratio (Benchmark): NaN")
+
+        except Exception as e:
+            print(f"Error during backtest execution for N={n_val}: {e}")
+            import traceback
+            print("Traceback:")
+            print(traceback.format_exc())
+        print("-" * 30) # Separator for different N runs
+else:
+    missing_data_reasons = []
+    if not all_test_predictions_flat: missing_data_reasons.append("predictions")
+    if not all_test_target_dates_flat: missing_data_reasons.append("target dates")
+    if not all_test_tickers_flat: missing_data_reasons.append("tickers")
+    if 'test_dataset' not in locals() or test_dataset is None: missing_data_reasons.append("test_dataset instance")
+    print(f"Skipping all backtests: Not enough valid data collected or test_dataset not available. Missing: {', '.join(missing_data_reasons)}.")
+
 
 # --- Save Model ---
 # The notebook had a prompt, using a fixed name here for simplicity.
