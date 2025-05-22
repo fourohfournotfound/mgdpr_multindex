@@ -360,58 +360,64 @@ class ParallelRetention(torch.nn.Module):
                 retained_x_sample_fp32 = torch.matmul(term_before_matmul_v_fp32, v_sample_fp32)
                 retained_x_sample_fp32 = torch.clamp(retained_x_sample_fp32, min=-5, max=5)
             
-            # Cast back to original dtype only at the end
-            retained_x_sample = retained_x_sample_fp32.to(x_reshaped_sample.dtype)
-            
-            # Validate retained_x_sample before GroupNorm
-            if torch.isinf(retained_x_sample).any() or torch.isnan(retained_x_sample).any():
-                print(f"WARNING: NaN/Inf in retained_x_sample at b_idx {b_idx}. Clamping values.")
-                retained_x_sample = torch.clamp(retained_x_sample, min=-10, max=10)
-            
-            # Apply Group Normalization (phi function from paper) with better error handling
-            if self.inter_dim > 0 and not isinstance(self.group_norm, nn.Identity):
-                try:
-                    # GroupNorm expects input (N, C, ...) where C is number of channels (self.inter_dim)
-                    # retained_x_sample is (time_dim, inter_dim)
-                    # Reshape for GroupNorm: (1, inter_dim, time_dim) assuming N=1 sample for GN
-                    retained_x_sample_norm_input = retained_x_sample.transpose(0, 1).unsqueeze(0)
-                    normalized_retained_x = self.group_norm(retained_x_sample_norm_input)
-                    
-                    # Validate GroupNorm output
-                    if torch.isinf(normalized_retained_x).any() or torch.isnan(normalized_retained_x).any():
-                        print(f"WARNING: NaN/Inf after GroupNorm at b_idx {b_idx}. Using input without normalization.")
-                        retained_x_for_activation = retained_x_sample
-                    else:
-                        # Reshape back to (time_dim, inter_dim)
-                        retained_x_for_activation = normalized_retained_x.squeeze(0).transpose(0, 1)
-                except Exception as e:
-                    print(f"ERROR in GroupNorm at b_idx {b_idx}: {e}. Skipping normalization.")
-                    retained_x_for_activation = retained_x_sample
-            else:
-                retained_x_for_activation = retained_x_sample # Skip GN if inter_dim is 0 or Identity
-            
-            # Final validation before activation
-            if torch.isinf(retained_x_for_activation).any() or torch.isnan(retained_x_for_activation).any():
-                print(f"WARNING: NaN/Inf before final activation at b_idx {b_idx}. Clamping values.")
-                retained_x_for_activation = torch.clamp(retained_x_for_activation, min=-10, max=10)
+            # Keep in FP32 for GroupNorm and final operations to maintain AMP stability
+            with torch.amp.autocast('cuda', enabled=False):  # Disable autocast for normalization
+                # Validate before GroupNorm
+                if torch.isinf(retained_x_sample_fp32).any() or torch.isnan(retained_x_sample_fp32).any():
+                    print(f"WARNING: NaN/Inf in retained_x_sample_fp32 at b_idx {b_idx}. Clamping values.")
+                    retained_x_sample_fp32 = torch.clamp(retained_x_sample_fp32, min=-5, max=5)
+                
+                # Apply Group Normalization in FP32 for stability
+                if self.inter_dim > 0 and not isinstance(self.group_norm, nn.Identity):
+                    try:
+                        # GroupNorm expects input (N, C, ...) where C is number of channels (self.inter_dim)
+                        # retained_x_sample_fp32 is (time_dim, inter_dim)
+                        # Reshape for GroupNorm: (1, inter_dim, time_dim) assuming N=1 sample for GN
+                        retained_x_sample_norm_input = retained_x_sample_fp32.transpose(0, 1).unsqueeze(0)
+                        
+                        # Apply GroupNorm in FP32
+                        normalized_retained_x = self.group_norm(retained_x_sample_norm_input.float())
+                        
+                        # Validate GroupNorm output
+                        if torch.isinf(normalized_retained_x).any() or torch.isnan(normalized_retained_x).any():
+                            print(f"WARNING: NaN/Inf after GroupNorm at b_idx {b_idx}. Using input without normalization.")
+                            retained_x_for_activation = retained_x_sample_fp32
+                        else:
+                            # Reshape back to (time_dim, inter_dim) and clamp
+                            retained_x_for_activation = normalized_retained_x.squeeze(0).transpose(0, 1)
+                            retained_x_for_activation = torch.clamp(retained_x_for_activation, min=-5, max=5)
+                    except Exception as e:
+                        print(f"ERROR in GroupNorm at b_idx {b_idx}: {e}. Skipping normalization.")
+                        retained_x_for_activation = retained_x_sample_fp32
+                else:
+                    retained_x_for_activation = retained_x_sample_fp32 # Skip GN if inter_dim is 0 or Identity
+                
+                # Final validation before activation
+                if torch.isinf(retained_x_for_activation).any() or torch.isnan(retained_x_for_activation).any():
+                    print(f"WARNING: NaN/Inf before final activation at b_idx {b_idx}. Clamping values.")
+                    retained_x_for_activation = torch.clamp(retained_x_for_activation, min=-5, max=5)
 
-            # Apply final linear layer and activation with error handling
-            try:
-                linear_output = self.ret_feat(retained_x_for_activation)
-                if torch.isinf(linear_output).any() or torch.isnan(linear_output).any():
-                    print(f"WARNING: NaN/Inf after final linear at b_idx {b_idx}. Clamping values.")
-                    linear_output = torch.clamp(linear_output, min=-10, max=10)
-                
-                output_x_sample = self.activation(linear_output) # (time_dim, out_dim)
-                
-                # Final output validation
-                if torch.isinf(output_x_sample).any() or torch.isnan(output_x_sample).any():
-                    print(f"ERROR: NaN/Inf in final output at b_idx {b_idx}. Using zeros.")
-                    output_x_sample = torch.zeros_like(output_x_sample)
+                # Apply final linear layer and activation in FP32
+                try:
+                    linear_output = self.ret_feat(retained_x_for_activation.float())
+                    if torch.isinf(linear_output).any() or torch.isnan(linear_output).any():
+                        print(f"WARNING: NaN/Inf after final linear at b_idx {b_idx}. Clamping values.")
+                        linear_output = torch.clamp(linear_output, min=-5, max=5)
                     
-            except Exception as e:
-                print(f"ERROR in final linear/activation at b_idx {b_idx}: {e}. Using zeros.")
-                output_x_sample = torch.zeros(self.time_dim, self.out_dim, device=retained_x_for_activation.device, dtype=retained_x_for_activation.dtype)
+                    output_x_sample = self.activation(linear_output) # (time_dim, out_dim)
+                    output_x_sample = torch.clamp(output_x_sample, min=-5, max=5)
+                    
+                    # Final output validation
+                    if torch.isinf(output_x_sample).any() or torch.isnan(output_x_sample).any():
+                        print(f"ERROR: NaN/Inf in final output at b_idx {b_idx}. Using small random values.")
+                        output_x_sample = torch.randn_like(output_x_sample) * 0.01
+                        
+                except Exception as e:
+                    print(f"ERROR in final linear/activation at b_idx {b_idx}: {e}. Using small random values.")
+                    output_x_sample = torch.randn(self.time_dim, self.out_dim, device=retained_x_for_activation.device, dtype=torch.float32) * 0.01
+
+            # Convert back to original dtype only at the very end
+            output_x_sample = output_x_sample.to(x_reshaped_sample.dtype)
 
             # Reshape to (Num_Nodes, Features_after_Retention)
             # This requires self.time_dim * self.out_dim to be divisible by num_nodes_original.
