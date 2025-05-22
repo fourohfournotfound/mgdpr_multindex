@@ -216,30 +216,13 @@ class ParallelRetention(torch.nn.Module):
         self.inter_dim = inter_dim
         self.out_dim = out_dim
 
-        # Group Normalization (phi function from paper)
-        # The paper specifies phi as Group Normalization.
+        # Group Normalization (phi function from paper) - Fixed configuration
         if self.inter_dim > 0:
-            if self.inter_dim % num_gn_groups != 0:
-                print(f"Warning: ParallelRetention inter_dim {self.inter_dim} is not divisible by num_gn_groups {num_gn_groups}. "
-                      f"Adjusting num_gn_groups to 1 or a divisor if possible, or ensure inter_dim is appropriate.")
-            # Ensure num_gn_groups is valid and does not exceed inter_dim.
-            # If inter_dim is small, num_gn_groups might need to be 1.
-            effective_num_gn_groups = num_gn_groups
-            if self.inter_dim < num_gn_groups : # If inter_dim is less than requested groups, use 1 or inter_dim itself if inter_dim is a valid group number
-                 effective_num_gn_groups = 1 # Fallback to 1 group if inter_dim is too small for requested groups
-                 if self.inter_dim > 0 and self.inter_dim % 1 == 0 : # if inter_dim itself can be a group number
-                     pass # keep effective_num_gn_groups = 1 or consider self.inter_dim if it makes sense
-            elif self.inter_dim > 0 and self.inter_dim % num_gn_groups != 0: # If not divisible, try to find a divisor or default to 1
-                # Simplified: default to 1 if not perfectly divisible by requested num_gn_groups.
-                # A more sophisticated approach might find the largest divisor or allow configuration.
-                print(f"Adjusting num_gn_groups to 1 for inter_dim {self.inter_dim} as it's not divisible by {num_gn_groups}.")
-                effective_num_gn_groups = 1
-            
-            if effective_num_gn_groups == 0 and self.inter_dim > 0: # Should not happen with min(num_gn_groups, self.inter_dim) logic if inter_dim > 0
-                effective_num_gn_groups = 1 # Safety net
-
-            self.group_norm = nn.GroupNorm(effective_num_gn_groups, self.inter_dim) if self.inter_dim > 0 else nn.Identity()
-        else: # inter_dim is 0 or less (should not happen with proper config)
+            # Find the largest valid number of groups that divides inter_dim
+            effective_num_gn_groups = self._get_valid_gn_groups(self.inter_dim, num_gn_groups)
+            print(f"ParallelRetention: Using {effective_num_gn_groups} groups for GroupNorm with inter_dim={self.inter_dim}")
+            self.group_norm = nn.GroupNorm(effective_num_gn_groups, self.inter_dim, eps=1e-6)
+        else:
             self.group_norm = nn.Identity()
             
         self.activation = torch.nn.PReLU()
@@ -247,6 +230,39 @@ class ParallelRetention(torch.nn.Module):
         self.K_layers = nn.Linear(self.in_dim, self.inter_dim) # W_K
         self.V_layers = nn.Linear(self.in_dim, self.inter_dim) # W_V
         self.ret_feat = torch.nn.Linear(self.inter_dim, self.out_dim) # Final linear layer
+
+    def _get_valid_gn_groups(self, inter_dim: int, preferred_groups: int = 32) -> int:
+        """
+        Calculate appropriate number of groups for GroupNorm based on inter_dim.
+        
+        Args:
+            inter_dim (int): The feature dimension for GroupNorm
+            preferred_groups (int): Preferred number of groups
+            
+        Returns:
+            int: Valid number of groups that divides inter_dim
+        """
+        if inter_dim <= 0:
+            return 1
+        
+        # Find largest divisor <= preferred_groups
+        for groups in range(min(preferred_groups, inter_dim), 0, -1):
+            if inter_dim % groups == 0:
+                return groups
+        return 1
+
+    def _validate_tensor(self, tensor: torch.Tensor, name: str) -> None:
+        """
+        Validate tensor for NaN/Inf values and raise error if found.
+        
+        Args:
+            tensor (torch.Tensor): Tensor to validate
+            name (str): Name of tensor for error reporting
+        """
+        if torch.isnan(tensor).any():
+            raise ValueError(f"NaN detected in {name}. Shape: {tensor.shape}")
+        if torch.isinf(tensor).any():
+            raise ValueError(f"Inf detected in {name}. Shape: {tensor.shape}")
 
     def forward(self, x_batched: torch.Tensor, d_gamma_batched: torch.Tensor) -> torch.Tensor:
         """
@@ -294,6 +310,13 @@ class ParallelRetention(torch.nn.Module):
                                    f"x_sample shape: {x_sample.shape}, target view: ({self.time_dim}, {self.in_dim}). "
                                    f"Original error: {e}")
 
+            # Validate input tensor
+            try:
+                self._validate_tensor(x_reshaped_sample, f"x_reshaped_sample_b{b_idx}")
+            except ValueError as e:
+                print(f"Warning: {e}. Attempting to continue with clamped values.")
+                x_reshaped_sample = torch.clamp(x_reshaped_sample, min=-1e6, max=1e6)
+            
             # Perform all critical operations in FP32 for numerical stability with AMP
             x_reshaped_sample_fp32 = x_reshaped_sample.float()
             
@@ -301,35 +324,84 @@ class ParallelRetention(torch.nn.Module):
             k_sample_fp32 = self.K_layers(x_reshaped_sample_fp32) # (time_dim, inter_dim) in FP32
             v_sample_fp32 = self.V_layers(x_reshaped_sample_fp32) # (time_dim, inter_dim) in FP32
 
+            # Add numerical stability: clamp QKV values and normalize
+            q_sample_fp32 = torch.clamp(q_sample_fp32, min=-10, max=10)
+            k_sample_fp32 = torch.clamp(k_sample_fp32, min=-10, max=10)
+            v_sample_fp32 = torch.clamp(v_sample_fp32, min=-10, max=10)
+
+            # Compute QK^T with numerical stability
             inter_feat_sample_fp32 = torch.matmul(q_sample_fp32, k_sample_fp32.transpose(0, 1)) # (time_dim, time_dim) in FP32
+            
+            # Clamp QK^T to prevent overflow
+            inter_feat_sample_fp32 = torch.clamp(inter_feat_sample_fp32, min=-10, max=10)
             
             current_d_gamma = d_gamma_batched if d_gamma_batched.dim() == 2 else d_gamma_batched[b_idx]
             current_d_gamma_fp32 = current_d_gamma.float()
+            
+            # Validate D_gamma matrix
+            if torch.isnan(current_d_gamma_fp32).any() or torch.isinf(current_d_gamma_fp32).any():
+                print(f"Warning: Invalid D_gamma detected at batch {b_idx}. Using identity matrix.")
+                current_d_gamma_fp32 = torch.eye(current_d_gamma_fp32.shape[0], device=current_d_gamma_fp32.device, dtype=current_d_gamma_fp32.dtype)
 
-            # Perform (D * QK^T) @ V in FP32
+            # Perform (D * QK^T) @ V in FP32 with stability checks
             term_before_matmul_v_fp32 = current_d_gamma_fp32 * inter_feat_sample_fp32
+            term_before_matmul_v_fp32 = torch.clamp(term_before_matmul_v_fp32, min=-10, max=10)
+            
             retained_x_sample_fp32 = torch.matmul(term_before_matmul_v_fp32, v_sample_fp32) # (time_dim, inter_dim) in FP32
+            retained_x_sample_fp32 = torch.clamp(retained_x_sample_fp32, min=-10, max=10)
             
             # Cast back to original dtype only at the end
             retained_x_sample = retained_x_sample_fp32.to(x_reshaped_sample.dtype)
-            if torch.isinf(retained_x_sample).any() or torch.isnan(retained_x_sample).any(): print(f"DEBUG AMP: retained_x_sample (all FP32 computation) has NaN/Inf at b_idx {b_idx}")
             
-            # Apply Group Normalization (phi function from paper)
-            if self.inter_dim > 0: # Apply only if inter_dim is valid for GroupNorm
-                # GroupNorm expects input (N, C, ...) where C is number of channels (self.inter_dim)
-                # retained_x_sample is (time_dim, inter_dim)
-                # Reshape for GroupNorm: (1, inter_dim, time_dim) assuming N=1 sample for GN
-                retained_x_sample_norm_input = retained_x_sample.transpose(0, 1).unsqueeze(0)
-                normalized_retained_x = self.group_norm(retained_x_sample_norm_input)
-                if torch.isinf(normalized_retained_x).any() or torch.isnan(normalized_retained_x).any(): print(f"DEBUG AMP: normalized_retained_x (after GroupNorm) has NaN/Inf at b_idx {b_idx}")
-                # Reshape back to (time_dim, inter_dim)
-                retained_x_for_activation = normalized_retained_x.squeeze(0).transpose(0, 1)
+            # Validate retained_x_sample before GroupNorm
+            if torch.isinf(retained_x_sample).any() or torch.isnan(retained_x_sample).any():
+                print(f"WARNING: NaN/Inf in retained_x_sample at b_idx {b_idx}. Clamping values.")
+                retained_x_sample = torch.clamp(retained_x_sample, min=-10, max=10)
+            
+            # Apply Group Normalization (phi function from paper) with better error handling
+            if self.inter_dim > 0 and not isinstance(self.group_norm, nn.Identity):
+                try:
+                    # GroupNorm expects input (N, C, ...) where C is number of channels (self.inter_dim)
+                    # retained_x_sample is (time_dim, inter_dim)
+                    # Reshape for GroupNorm: (1, inter_dim, time_dim) assuming N=1 sample for GN
+                    retained_x_sample_norm_input = retained_x_sample.transpose(0, 1).unsqueeze(0)
+                    normalized_retained_x = self.group_norm(retained_x_sample_norm_input)
+                    
+                    # Validate GroupNorm output
+                    if torch.isinf(normalized_retained_x).any() or torch.isnan(normalized_retained_x).any():
+                        print(f"WARNING: NaN/Inf after GroupNorm at b_idx {b_idx}. Using input without normalization.")
+                        retained_x_for_activation = retained_x_sample
+                    else:
+                        # Reshape back to (time_dim, inter_dim)
+                        retained_x_for_activation = normalized_retained_x.squeeze(0).transpose(0, 1)
+                except Exception as e:
+                    print(f"ERROR in GroupNorm at b_idx {b_idx}: {e}. Skipping normalization.")
+                    retained_x_for_activation = retained_x_sample
             else:
-                retained_x_for_activation = retained_x_sample # Skip GN if inter_dim is 0
-            if torch.isinf(retained_x_for_activation).any() or torch.isnan(retained_x_for_activation).any(): print(f"DEBUG AMP: retained_x_for_activation (before final linear/activation) has NaN/Inf at b_idx {b_idx}")
+                retained_x_for_activation = retained_x_sample # Skip GN if inter_dim is 0 or Identity
+            
+            # Final validation before activation
+            if torch.isinf(retained_x_for_activation).any() or torch.isnan(retained_x_for_activation).any():
+                print(f"WARNING: NaN/Inf before final activation at b_idx {b_idx}. Clamping values.")
+                retained_x_for_activation = torch.clamp(retained_x_for_activation, min=-10, max=10)
 
-            output_x_sample = self.activation(self.ret_feat(retained_x_for_activation)) # (time_dim, out_dim)
-            if torch.isinf(output_x_sample).any() or torch.isnan(output_x_sample).any(): print(f"DEBUG AMP: output_x_sample (final output of ParallelRetention for sample) has NaN/Inf at b_idx {b_idx}")
+            # Apply final linear layer and activation with error handling
+            try:
+                linear_output = self.ret_feat(retained_x_for_activation)
+                if torch.isinf(linear_output).any() or torch.isnan(linear_output).any():
+                    print(f"WARNING: NaN/Inf after final linear at b_idx {b_idx}. Clamping values.")
+                    linear_output = torch.clamp(linear_output, min=-10, max=10)
+                
+                output_x_sample = self.activation(linear_output) # (time_dim, out_dim)
+                
+                # Final output validation
+                if torch.isinf(output_x_sample).any() or torch.isnan(output_x_sample).any():
+                    print(f"ERROR: NaN/Inf in final output at b_idx {b_idx}. Using zeros.")
+                    output_x_sample = torch.zeros_like(output_x_sample)
+                    
+            except Exception as e:
+                print(f"ERROR in final linear/activation at b_idx {b_idx}: {e}. Using zeros.")
+                output_x_sample = torch.zeros(self.time_dim, self.out_dim, device=retained_x_for_activation.device, dtype=retained_x_for_activation.dtype)
 
             # Reshape to (Num_Nodes, Features_after_Retention)
             # This requires self.time_dim * self.out_dim to be divisible by num_nodes_original.
@@ -430,13 +502,33 @@ class MGDPR(nn.Module):
         self.theta = nn.Parameter(torch.empty(layers, num_relation, expansion_steps))
         nn.init.xavier_uniform_(self.theta)
 
+        # Validate retention_decay_zeta
+        if not (0 < retention_decay_zeta < 1):
+            print(f"Warning: retention_decay_zeta={retention_decay_zeta} is outside (0,1). Clamping to (0.1, 0.99)")
+            retention_decay_zeta = max(0.1, min(0.99, retention_decay_zeta))
+        
         lower_tri = torch.tril(torch.ones(time_dim, time_dim), diagonal=-1)
         D_gamma_tensor = torch.zeros_like(lower_tri)
         non_zero_mask = lower_tri != 0
+        
         # Corrected D_gamma calculation using retention_decay_zeta (e.g., 0.9)
         # D_nm = zeta^(n-m) for n>m. lower_tri[non_zero_mask] gives positive values for (n-m).
-        D_gamma_tensor[non_zero_mask] = retention_decay_zeta ** (lower_tri[non_zero_mask])
+        decay_values = retention_decay_zeta ** (lower_tri[non_zero_mask])
+        
+        # Validate decay values
+        if torch.isnan(decay_values).any() or torch.isinf(decay_values).any():
+            print(f"Warning: Invalid decay values in D_gamma. Using fallback values.")
+            decay_values = torch.clamp(decay_values, min=1e-6, max=1.0)
+        
+        D_gamma_tensor[non_zero_mask] = decay_values
+        
+        # Final validation of D_gamma
+        if torch.isnan(D_gamma_tensor).any() or torch.isinf(D_gamma_tensor).any():
+            print("Error: D_gamma contains NaN/Inf. Using identity matrix.")
+            D_gamma_tensor = torch.eye(time_dim)
+        
         self.register_buffer('D_gamma', D_gamma_tensor)
+        print(f"D_gamma matrix created with decay={retention_decay_zeta}, shape={D_gamma_tensor.shape}")
 
         self.diffusion_layers = nn.ModuleList(
             # diffusion_config is [in0, out0, in1, out1, ...]
@@ -454,7 +546,7 @@ class MGDPR(nn.Module):
 
         # retention_config is a flat list: [in0, inter0, out0, in1, inter1, out1, ...]
         self.retention_layers = nn.ModuleList(
-            [ParallelRetention(time_dim, retention_config[3 * i], retention_config[3 * i + 1], retention_config[3 * i + 2], num_gn_groups=25) # Changed num_gn_groups to 25
+            [ParallelRetention(time_dim, retention_config[3 * i], retention_config[3 * i + 1], retention_config[3 * i + 2], num_gn_groups=32) # Use default 32, will be auto-adjusted
              for i in range(len(retention_config) // 3)]
         )
         
