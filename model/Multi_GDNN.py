@@ -310,45 +310,55 @@ class ParallelRetention(torch.nn.Module):
                                    f"x_sample shape: {x_sample.shape}, target view: ({self.time_dim}, {self.in_dim}). "
                                    f"Original error: {e}")
 
-            # Validate input tensor
-            try:
-                self._validate_tensor(x_reshaped_sample, f"x_reshaped_sample_b{b_idx}")
-            except ValueError as e:
-                print(f"Warning: {e}. Attempting to continue with clamped values.")
-                x_reshaped_sample = torch.clamp(x_reshaped_sample, min=-1e6, max=1e6)
+            # Validate input tensor with AMP-safe clamping
+            if torch.isnan(x_reshaped_sample).any() or torch.isinf(x_reshaped_sample).any():
+                print(f"Warning: NaN/Inf in input at b_idx {b_idx}. Clamping values.")
+                x_reshaped_sample = torch.clamp(x_reshaped_sample, min=-100, max=100)
             
-            # Perform all critical operations in FP32 for numerical stability with AMP
-            x_reshaped_sample_fp32 = x_reshaped_sample.float()
-            
-            q_sample_fp32 = self.Q_layers(x_reshaped_sample_fp32) # (time_dim, inter_dim) in FP32
-            k_sample_fp32 = self.K_layers(x_reshaped_sample_fp32) # (time_dim, inter_dim) in FP32
-            v_sample_fp32 = self.V_layers(x_reshaped_sample_fp32) # (time_dim, inter_dim) in FP32
+            # Force FP32 for ALL critical operations to avoid AMP instability
+            with torch.amp.autocast('cuda', enabled=False):  # Disable autocast for this block
+                x_reshaped_sample_fp32 = x_reshaped_sample.float()
+                
+                # Apply QKV transformations in FP32
+                q_sample_fp32 = self.Q_layers(x_reshaped_sample_fp32) # (time_dim, inter_dim) in FP32
+                k_sample_fp32 = self.K_layers(x_reshaped_sample_fp32) # (time_dim, inter_dim) in FP32
+                v_sample_fp32 = self.V_layers(x_reshaped_sample_fp32) # (time_dim, inter_dim) in FP32
 
-            # Add numerical stability: clamp QKV values and normalize
-            q_sample_fp32 = torch.clamp(q_sample_fp32, min=-10, max=10)
-            k_sample_fp32 = torch.clamp(k_sample_fp32, min=-10, max=10)
-            v_sample_fp32 = torch.clamp(v_sample_fp32, min=-10, max=10)
+                # Normalize QKV to prevent large values
+                q_sample_fp32 = F.normalize(q_sample_fp32, p=2, dim=-1) * (self.inter_dim ** 0.5)
+                k_sample_fp32 = F.normalize(k_sample_fp32, p=2, dim=-1) * (self.inter_dim ** 0.5)
+                v_sample_fp32 = F.normalize(v_sample_fp32, p=2, dim=-1) * (self.inter_dim ** 0.5)
+                
+                # Additional safety clamping
+                q_sample_fp32 = torch.clamp(q_sample_fp32, min=-5, max=5)
+                k_sample_fp32 = torch.clamp(k_sample_fp32, min=-5, max=5)
+                v_sample_fp32 = torch.clamp(v_sample_fp32, min=-5, max=5)
 
-            # Compute QK^T with numerical stability
-            inter_feat_sample_fp32 = torch.matmul(q_sample_fp32, k_sample_fp32.transpose(0, 1)) # (time_dim, time_dim) in FP32
-            
-            # Clamp QK^T to prevent overflow
-            inter_feat_sample_fp32 = torch.clamp(inter_feat_sample_fp32, min=-10, max=10)
-            
-            current_d_gamma = d_gamma_batched if d_gamma_batched.dim() == 2 else d_gamma_batched[b_idx]
-            current_d_gamma_fp32 = current_d_gamma.float()
-            
-            # Validate D_gamma matrix
-            if torch.isnan(current_d_gamma_fp32).any() or torch.isinf(current_d_gamma_fp32).any():
-                print(f"Warning: Invalid D_gamma detected at batch {b_idx}. Using identity matrix.")
-                current_d_gamma_fp32 = torch.eye(current_d_gamma_fp32.shape[0], device=current_d_gamma_fp32.device, dtype=current_d_gamma_fp32.dtype)
+                # Compute QK^T with scaled attention to prevent overflow
+                scale_factor = 1.0 / (self.inter_dim ** 0.5)  # Standard attention scaling
+                inter_feat_sample_fp32 = torch.matmul(q_sample_fp32, k_sample_fp32.transpose(0, 1)) * scale_factor
+                
+                # Clamp attention scores
+                inter_feat_sample_fp32 = torch.clamp(inter_feat_sample_fp32, min=-5, max=5)
+                
+                current_d_gamma = d_gamma_batched if d_gamma_batched.dim() == 2 else d_gamma_batched[b_idx]
+                current_d_gamma_fp32 = current_d_gamma.float()
+                
+                # Validate and fix D_gamma matrix
+                if torch.isnan(current_d_gamma_fp32).any() or torch.isinf(current_d_gamma_fp32).any():
+                    print(f"Warning: Invalid D_gamma detected at batch {b_idx}. Using identity matrix.")
+                    current_d_gamma_fp32 = torch.eye(current_d_gamma_fp32.shape[0], device=current_d_gamma_fp32.device, dtype=torch.float32)
+                
+                # Clamp D_gamma values to safe range
+                current_d_gamma_fp32 = torch.clamp(current_d_gamma_fp32, min=0, max=1)
 
-            # Perform (D * QK^T) @ V in FP32 with stability checks
-            term_before_matmul_v_fp32 = current_d_gamma_fp32 * inter_feat_sample_fp32
-            term_before_matmul_v_fp32 = torch.clamp(term_before_matmul_v_fp32, min=-10, max=10)
-            
-            retained_x_sample_fp32 = torch.matmul(term_before_matmul_v_fp32, v_sample_fp32) # (time_dim, inter_dim) in FP32
-            retained_x_sample_fp32 = torch.clamp(retained_x_sample_fp32, min=-10, max=10)
+                # Apply decay matrix with additional stability
+                term_before_matmul_v_fp32 = current_d_gamma_fp32 * inter_feat_sample_fp32
+                term_before_matmul_v_fp32 = torch.clamp(term_before_matmul_v_fp32, min=-5, max=5)
+                
+                # Final matrix multiplication
+                retained_x_sample_fp32 = torch.matmul(term_before_matmul_v_fp32, v_sample_fp32)
+                retained_x_sample_fp32 = torch.clamp(retained_x_sample_fp32, min=-5, max=5)
             
             # Cast back to original dtype only at the end
             retained_x_sample = retained_x_sample_fp32.to(x_reshaped_sample.dtype)
