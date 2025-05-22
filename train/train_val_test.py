@@ -73,7 +73,7 @@ com_list_csv_paths = [
 # Root directory for individual stock data CSVs (e.g., market_ticker_30Y.csv)
 # MyDataset expects files like: os.path.join(root_data_dir, f'{market}_{ticker}_30Y.csv')
 # TODO: Update this path to your local raw stock data CSV file
-root_data_dir = "/workspaces/ai_testground/2_4_25_random_fundamentals_options_filtered_and_aligned.csv" # Path to the single stock data CSV file
+root_data_dir = "/workspaces/ai_testground/05_06_25_sp50_fundamentals_options_filtered_and_aligned.csv" # Path to the single stock data CSV file
 
 # Destination directory for generated graph .pt files
 # MyDataset will create subfolders like: os.path.join(graph_dest_dir, f'{market}_{type}_{start}_{end}_{window}')
@@ -464,6 +464,9 @@ for l_idx in range(d_layers):
     # for the input h[rel] to the fc_layers in the next MD block (l_idx+1).
     current_fc_input_dim = fc_output_dim
 
+
+print(f"DEBUG: About to instantiate MGDPR. num_companies = {num_companies}")
+print(f"DEBUG: MGDPR args: d_layers={d_layers}, num_nodes (from num_companies)={num_companies}, model_feature_len={model_feature_len}, num_relation={num_relation}, expansion_steps={diffusion_steps}")
 
 model = MGDPR(actual_diffusion_config, retention_config, ret_linear_1_config, ret_linear_2_config, mlp_config,
               d_layers, num_companies, model_feature_len, num_relation, retention_decay_zeta, diffusion_steps, regularization_gamma_param=regularization_gamma) # Pass retention_decay_zeta and optional regularization_gamma

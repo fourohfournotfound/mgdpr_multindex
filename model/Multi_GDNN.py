@@ -76,16 +76,37 @@ class MultiReDiffusion(torch.nn.Module):
         theta_param_normalized = torch.softmax(theta_param, dim=-1)
         theta_p_exp = theta_param_normalized.unsqueeze(0).unsqueeze(3).unsqueeze(4)
         
-        # Normalize t_param along the node dimension (dim=2 of t_param, which is N_source for M_ij)
-        # t_param original shape: (R, E, N_target, N_source)
-        # We want to softmax over N_source, so dim=3 (or -1)
-        t_param_normalized = torch.softmax(t_param, dim=3) # Paper: column-stochastic, sum over j M_ij = 1
-                                                          # If t_param is (R,E,N,N) as M_target_source, softmax over source (dim 3)
+        # t_param (T_{l,r,k}): (Num_Relations, Expansion_Steps, Num_Nodes_model, Num_Nodes_model)
+        # num_nodes (calculated at line 68) is N_data from x_input_batched.shape[2]
+        
+        num_nodes_model_dim2 = t_param.shape[2]
+        num_nodes_model_dim3 = t_param.shape[3]
 
-        # t_param_normalized: (R, E, N, N) -> reshape to (1, R, E, N, N) for broadcasting
+        if num_nodes_model_dim2 != num_nodes_model_dim3:
+            raise ValueError(f"t_param is not square in node dimensions: {t_param.shape}")
+        
+        num_nodes_model = num_nodes_model_dim2 # N_model from MGDPR initialization (e.g. 43)
+
+        if num_nodes > num_nodes_model: # N_data > N_model
+            raise ValueError(f"Number of nodes in input data ({num_nodes}) "
+                             f"is greater than model's T matrix configured number of nodes ({num_nodes_model}).")
+
+        # Prepare t_param for the current batch's node size (num_nodes, which is N_data)
+        if num_nodes < num_nodes_model:
+            # Slice t_param to match the number of nodes in the current batch
+            t_param_for_batch = t_param[:, :, :num_nodes, :num_nodes]
+        else: # num_nodes == num_nodes_model
+            t_param_for_batch = t_param
+        
+        # Normalize the (potentially sliced) t_param_for_batch.
+        # t_param_normalized will have shape (R, E, N_data, N_data)
+        t_param_normalized = torch.softmax(t_param_for_batch, dim=3) # Paper: column-stochastic, sum over j M_ij = 1
+        
+        # t_p_exp will have shape (1, R, E, N_data, N_data)
         t_p_exp = t_param_normalized.unsqueeze(0)
         
-        # a_input_batched: (B, R, N, N) -> reshape to (B, R, 1, N, N) for broadcasting
+        # a_input_batched already has N_data as its node dimensions.
+        # a_in_b_exp will have shape (B, R, 1, N_data, N_data)
         a_in_b_exp = a_input_batched.unsqueeze(2)
 
         # Element-wise product for terms to be summed over Expansion_Steps (dim=2)
