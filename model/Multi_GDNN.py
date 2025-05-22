@@ -295,14 +295,24 @@ class ParallelRetention(torch.nn.Module):
                                    f"Original error: {e}")
 
             q_sample = self.Q_layers(x_reshaped_sample) # (time_dim, inter_dim)
+            if torch.isinf(q_sample).any() or torch.isnan(q_sample).any(): print(f"DEBUG AMP: q_sample has NaN/Inf at b_idx {b_idx}")
             k_sample = self.K_layers(x_reshaped_sample) # (time_dim, inter_dim)
+            if torch.isinf(k_sample).any() or torch.isnan(k_sample).any(): print(f"DEBUG AMP: k_sample has NaN/Inf at b_idx {b_idx}")
             v_sample = self.V_layers(x_reshaped_sample) # (time_dim, inter_dim)
+            if torch.isinf(v_sample).any() or torch.isnan(v_sample).any(): print(f"DEBUG AMP: v_sample has NaN/Inf at b_idx {b_idx}")
 
             inter_feat_sample = torch.matmul(q_sample, k_sample.transpose(0, 1)) # (time_dim, time_dim)
+            if torch.isinf(inter_feat_sample).any() or torch.isnan(inter_feat_sample).any(): print(f"DEBUG AMP: inter_feat_sample has NaN/Inf at b_idx {b_idx}")
             
             current_d_gamma = d_gamma_batched if d_gamma_batched.dim() == 2 else d_gamma_batched[b_idx]
+            if torch.isinf(current_d_gamma).any() or torch.isnan(current_d_gamma).any(): print(f"DEBUG AMP: current_d_gamma has NaN/Inf at b_idx {b_idx}")
 
-            retained_x_sample = torch.matmul(current_d_gamma * inter_feat_sample, v_sample) # (time_dim, inter_dim)
+            # Check current_d_gamma * inter_feat_sample before matmul with v_sample
+            term_before_matmul_v = current_d_gamma * inter_feat_sample
+            if torch.isinf(term_before_matmul_v).any() or torch.isnan(term_before_matmul_v).any(): print(f"DEBUG AMP: (current_d_gamma * inter_feat_sample) has NaN/Inf at b_idx {b_idx}")
+
+            retained_x_sample = torch.matmul(term_before_matmul_v, v_sample) # (time_dim, inter_dim)
+            if torch.isinf(retained_x_sample).any() or torch.isnan(retained_x_sample).any(): print(f"DEBUG AMP: retained_x_sample (after matmul with V) has NaN/Inf at b_idx {b_idx}")
             
             # Apply Group Normalization (phi function from paper)
             if self.inter_dim > 0: # Apply only if inter_dim is valid for GroupNorm
@@ -311,12 +321,15 @@ class ParallelRetention(torch.nn.Module):
                 # Reshape for GroupNorm: (1, inter_dim, time_dim) assuming N=1 sample for GN
                 retained_x_sample_norm_input = retained_x_sample.transpose(0, 1).unsqueeze(0)
                 normalized_retained_x = self.group_norm(retained_x_sample_norm_input)
+                if torch.isinf(normalized_retained_x).any() or torch.isnan(normalized_retained_x).any(): print(f"DEBUG AMP: normalized_retained_x (after GroupNorm) has NaN/Inf at b_idx {b_idx}")
                 # Reshape back to (time_dim, inter_dim)
                 retained_x_for_activation = normalized_retained_x.squeeze(0).transpose(0, 1)
             else:
                 retained_x_for_activation = retained_x_sample # Skip GN if inter_dim is 0
+            if torch.isinf(retained_x_for_activation).any() or torch.isnan(retained_x_for_activation).any(): print(f"DEBUG AMP: retained_x_for_activation (before final linear/activation) has NaN/Inf at b_idx {b_idx}")
 
             output_x_sample = self.activation(self.ret_feat(retained_x_for_activation)) # (time_dim, out_dim)
+            if torch.isinf(output_x_sample).any() or torch.isnan(output_x_sample).any(): print(f"DEBUG AMP: output_x_sample (final output of ParallelRetention for sample) has NaN/Inf at b_idx {b_idx}")
 
             # Reshape to (Num_Nodes, Features_after_Retention)
             # This requires self.time_dim * self.out_dim to be divisible by num_nodes_original.
