@@ -34,6 +34,7 @@ parser.add_argument('--batch_size', type=int, default=32, help='Batch size for D
 parser.add_argument('--num_workers', type=int, default=os.cpu_count() // 2 if os.cpu_count() else 4, help='Number of worker processes for data loading.')
 parser.add_argument('--pin_memory', type=lambda x: (str(x).lower() == 'true'), default=True, help='Pin memory for faster CPU to GPU data transfer (True/False).')
 parser.add_argument('--use_amp', type=lambda x: (str(x).lower() == 'true'), default=True, help='Enable Automatic Mixed Precision (AMP) training (True/False).')
+parser.add_argument('--top_features', type=int, default=20, help='Number of top features to keep using GRACES feature selection.')
 
 # Profiler arguments
 parser.add_argument('--profile', type=lambda x: (str(x).lower() == 'true'), default=False, help='Enable PyTorch profiler (True/False).')
@@ -284,10 +285,16 @@ else:
             lambda x: (x - x.mean()) / (x.std(ddof=0) if x.std(ddof=0) > 1e-8 else 1.0)
         )
         target_vec = temp_df['z'].fillna(0.0).values
-        _ = graces_select(log1p_training_features_np, target_vec,
-                           k=len(features_to_scale_columns))
-        selected_feature_idx = None
-        print("GRACES selection computed but all features will be used.")
+        graces_ranking = graces_select(
+            log1p_training_features_np,
+            target_vec,
+            k=len(features_to_scale_columns),
+        )
+        top_k = min(args.top_features, len(graces_ranking))
+        selected_feature_idx = graces_ranking[:top_k]
+        print(
+            f"GRACES selected top {top_k} feature indices: {selected_feature_idx}"
+        )
 
 # --- Main Dataset Instantiation (passing the fitted_scaler) ---
 print("Initializing training dataset with scaler and GRACES-selected features...")
@@ -365,7 +372,7 @@ if num_companies == 0:
 model_feature_len = window_size  # This is the actual length of the feature vector per node/relation from X
 # d_layers, num_relation, m_gamma, diffusion_steps = 6, 5, 2.5e-4, 7 # Old line
 d_layers, regularization_gamma, diffusion_steps = 5, 2.5e-4, 7
-num_relation = len(features_to_scale_columns)
+num_relation = len(selected_feature_idx) if selected_feature_idx is not None else len(features_to_scale_columns)
 edge_mask_lambda = 5e-4  # L1 penalty for learnable edge masks
 retention_decay_zeta = 0.9 # Using a proper decay value (0 < zeta < 1) as per troubleshooting.md and RetNet principles
 
