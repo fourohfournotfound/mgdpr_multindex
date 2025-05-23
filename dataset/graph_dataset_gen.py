@@ -126,7 +126,11 @@ def _mp_worker_graph_generation_task(
         X_processed = X_features_full_window[:, :, :-1].clone()
 
         for k_feature_idx in range(X_processed.shape[0]):
-            X_processed[k_feature_idx] = torch.Tensor(np.log1p(X_processed[k_feature_idx].numpy()))
+            # Clamp values to avoid log1p producing -inf or NaN when data
+            # contains values <= -1. 1e-6 is used as a tiny epsilon so the
+            # minimum passed to log1p is (-1 + epsilon).
+            clamped_vals = torch.clamp(X_processed[k_feature_idx], min=-1 + 1e-6)
+            X_processed[k_feature_idx] = torch.log1p(clamped_vals)
             # Z-score normalization removed to match demo notebook more closely for now
             # mean = X_processed[k_feature_idx].mean(dim=1, keepdim=True)
             # std = X_processed[k_feature_idx].std(dim=1, keepdim=True)

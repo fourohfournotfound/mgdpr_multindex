@@ -260,8 +260,12 @@ else:
         fitted_scaler = None
         selected_feature_idx = None
     else:
-        # Apply log1p transformation, similar to how it's done per window before scaling
-        log1p_training_features_np = np.log1p(training_features_np)
+        # Apply log1p transformation with clamping to avoid NaN/inf when any
+        # feature value is <= -1. Values are clipped to (-1 + epsilon) before
+        # applying log1p so the transformation remains finite.
+        epsilon = 1e-6
+        training_features_clamped = np.clip(training_features_np, a_min=-1 + epsilon, a_max=None)
+        log1p_training_features_np = np.log1p(training_features_clamped)
         
         # Initialize and fit the StandardScaler
         scaler = StandardScaler()
