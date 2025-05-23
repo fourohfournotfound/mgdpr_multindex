@@ -1032,6 +1032,7 @@ else:
 
                 if 'original_ticker_order' in test_sample:
                     print(f"  test_sample['original_ticker_order'] (type: {type(test_sample['original_ticker_order'])}, len: {len(test_sample['original_ticker_order']) if isinstance(test_sample['original_ticker_order'], list) else 'N/A'}):")
+                    print(f"    (Note: This is often a list of identical lists due to DataLoader collation of 'self.comlist' from MyDataset.__getitem__)")
                     # For list of lists, print info about the first inner list
                     if isinstance(test_sample['original_ticker_order'], list) and len(test_sample['original_ticker_order']) > 0 and isinstance(test_sample['original_ticker_order'][0], list):
                         print(f"    First inner list len: {len(test_sample['original_ticker_order'][0])}, First 5 tickers: {test_sample['original_ticker_order'][0][:5]}")
@@ -1039,8 +1040,14 @@ else:
                         print(f"    {test_sample['original_ticker_order'][:5] if isinstance(test_sample['original_ticker_order'], list) else test_sample['original_ticker_order']}")
                 else:
                     print(f"  'original_ticker_order' NOT IN test_sample. Keys: {list(test_sample.keys())}")
+                
+                # Print the definitive target_com_list for comparison (this is test_dataset.comlist)
+                # This `target_com_list` is the one used to initialize the test_dataset.
+                print(f"  Global 'target_com_list' (used for test_dataset.comlist) (type: {type(target_com_list)}, len: {len(target_com_list)}):")
+                print(f"    First 5 tickers: {target_com_list[:5]}")
 
             # --- Start: Debug and Robust Access for Backtest Data ---
+            # Note: The logic below (lines 1054-1058) correctly uses `target_com_list` as `tickers_for_all_graphs_in_dataset`
             if 'target_date_str' not in test_sample: # Only check for target_date_str now
                 print(f"DEBUG: Batch {i_test+1}: 'target_date_str' key MISSING from test_sample. Keys found: {list(test_sample.keys())}. Skipping batch for backtest data collection.")
                 continue
@@ -1157,6 +1164,26 @@ else:
     avg_test_spearman_str = f"Spearman={np.mean(test_spearman_coeffs):.4f}" if test_spearman_coeffs else "Spearman=N/A"
 
     print(f"Test Results: Avg Loss={avg_test_loss:.4f}, {avg_test_ndcg_str}, {avg_test_spearman_str}")
+
+    # --- Save Test Predictions to CSV ---
+    if all_test_target_dates_flat and all_test_tickers_flat and all_test_predictions_flat:
+        try:
+            predictions_log_df = pd.DataFrame({
+                'Date': all_test_target_dates_flat,
+                'Ticker': all_test_tickers_flat,
+                'PredictionScore': all_test_predictions_flat
+            })
+            # Sort by Date and Ticker for consistent output
+            predictions_log_df['Date'] = pd.to_datetime(predictions_log_df['Date'])
+            predictions_log_df.sort_values(by=['Date', 'Ticker'], inplace=True)
+            
+            csv_save_path = 'test_predictions.csv'
+            predictions_log_df.to_csv(csv_save_path, index=False)
+            print(f"Test predictions saved to {csv_save_path}")
+        except Exception as e:
+            print(f"Error saving test predictions to CSV: {e}")
+    else:
+        print("Skipping saving test predictions to CSV as one or more of the required lists (dates, tickers, predictions) is empty.")
 
 # --- Backtesting ---
 print("\n--- Running Backtests for Different N Tickers ---")

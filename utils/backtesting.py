@@ -12,15 +12,19 @@ from typing import Tuple # Added for type hinting
 # from ..dataset.graph_dataset_gen import MyDataset # Example, if MyDataset type hint was strictly needed
 
 
-def _calculate_daily_strategy_returns(daily_group: pd.DataFrame, num_tickers: int) -> Tuple[float, float, float]:
+def _calculate_daily_strategy_returns(daily_group: pd.DataFrame, num_tickers: int, date_val: pd.Timestamp, trades_log: list) -> Tuple[float, float, float]:
     """
     Calculates the strategy return for a single day's group of predictions.
     Strategy: Long top N stocks, short bottom N stocks based on prediction.
+    Also logs the trades made.
 
     Args:
         daily_group (pd.DataFrame): DataFrame for a single day, containing 'Prediction'
                                     and 'DailyReturn' columns for various tickers.
         num_tickers (int): Number of tickers for top-N long and bottom-N short.
+        date_val (pd.Timestamp): The current date for logging.
+        trades_log (list): A list to append trade dictionaries to.
+
 
     Returns:
         Tuple[float, float, float]: (avg_long_leg_return, avg_short_leg_pnl, combined_strategy_return)
@@ -70,6 +74,24 @@ def _calculate_daily_strategy_returns(daily_group: pd.DataFrame, num_tickers: in
         # If N > 1, this indicates an issue. For now, return 0.
         return 0.0, 0.0, 0.0
 
+    # Log trades
+    for _, row in top_stocks.iterrows():
+        trades_log.append({
+            'Date': date_val.strftime('%Y-%m-%d'),
+            'Ticker': row['Ticker'],
+            'Action': 'Long',
+            'PredictionScore': row['Prediction'],
+            'ActualDailyReturn': row['DailyReturn']
+        })
+    
+    for _, row in bottom_stocks.iterrows():
+        trades_log.append({
+            'Date': date_val.strftime('%Y-%m-%d'),
+            'Ticker': row['Ticker'],
+            'Action': 'Short',
+            'PredictionScore': row['Prediction'],
+            'ActualDailyReturn': row['DailyReturn']
+        })
 
     long_leg_returns = top_stocks['DailyReturn'].fillna(0.0) # Fill NaNs with 0 for averaging
     short_stocks_actual_returns = bottom_stocks['DailyReturn'].fillna(0.0)
@@ -205,6 +227,7 @@ def run_backtest(
     """
     warnings.filterwarnings("ignore", category=RuntimeWarning, message="Mean of empty slice")
     print("Initializing backtest...")
+    all_trades_log = [] # Initialize list to store trade details
 
     if not all_predictions_list or not all_target_dates_list or not all_tickers_list:
         print(f"Warning: Empty predictions, dates, or tickers list for N={num_tickers_to_trade}. Skipping backtest.")
@@ -260,9 +283,10 @@ def run_backtest(
     # 3. Calculate daily strategy returns (long, short P&L, combined)
     daily_predictions_with_returns = daily_predictions_with_returns.sort_values(by='Date')
     
-    # Apply will return a Series of tuples. Pass num_tickers_to_trade.
+    # Apply will return a Series of tuples. Pass num_tickers_to_trade and the log list.
+    # The lambda now needs to pass the date (group name) and the log list.
     daily_returns_tuples_series = daily_predictions_with_returns.groupby('Date', group_keys=False).apply(
-        lambda x: _calculate_daily_strategy_returns(x, num_tickers_to_trade)
+        lambda x: _calculate_daily_strategy_returns(x, num_tickers_to_trade, x.name, all_trades_log)
     )
 
     # Unpack the tuples into separate Series
@@ -328,7 +352,21 @@ def run_backtest(
     print(f"N={num_tickers_to_trade} - Sortino Ratio (Combined Strategy): {sortino_combined:.4f}")
     print(f"N={num_tickers_to_trade} - Sortino Ratio (Benchmark): {sortino_benchmark:.4f}")
 
-    # 7. Plot cumulative returns
+    # 7. Print last 10 trades
+    print(f"DEBUG: Checking all_trades_log before printing. Length: {len(all_trades_log)}") # Added debug print
+    if all_trades_log:
+        trades_df = pd.DataFrame(all_trades_log)
+        # Sort by Date and Ticker for consistent display, though already appended chronologically by date.
+        # trades_df['Date'] = pd.to_datetime(trades_df['Date']) # Date is already string 'YYYY-MM-DD'
+        # trades_df.sort_values(by=['Date', 'Ticker'], inplace=True) # Not strictly necessary if appended in order
+        
+        print(f"\n--- Last 10 Recorded Trade Actions for N={num_tickers_to_trade} ---")
+        # Use to_string to prevent truncation of columns/rows by default pandas print
+        print(trades_df.tail(10).to_string())
+    else:
+        print(f"\nNo trades were logged for N={num_tickers_to_trade}.")
+
+    # 8. Plot cumulative returns
     plot_cumulative_returns(
         long_cumulative_returns=long_cumulative_returns,
         short_cumulative_pnl=short_cumulative_pnl,
