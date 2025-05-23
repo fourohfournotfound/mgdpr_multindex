@@ -585,7 +585,7 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
     Processes a single batch of training data.
     """
     if use_mtgnn:
-        X = batch_sample['X_mtgnn'].to(device).permute(0, 1, 3, 2)
+        X = batch_sample['X_mtgnn'].to(device).permute(0, 3, 1, 2)
         A = None
     else:
         X = batch_sample['X'].to(device)
@@ -894,7 +894,7 @@ for epoch in range(epochs):
         with torch.no_grad():
             for i_val, val_sample in enumerate(val_loader):
                 if args.model.lower() == 'mtgnn':
-                    X_val = val_sample['X_mtgnn'].to(device).permute(0, 1, 3, 2)
+                    X_val = val_sample['X_mtgnn'].to(device).permute(0, 3, 1, 2)
                     A_val = None
                 else:
                     X_val = val_sample['X'].to(device)
@@ -1015,7 +1015,7 @@ else:
     with torch.no_grad():
         for i_test, test_sample in enumerate(test_loader):
             if args.model.lower() == 'mtgnn':
-                X_test = test_sample['X_mtgnn'].to(device).permute(0, 1, 3, 2)
+                X_test = test_sample['X_mtgnn'].to(device).permute(0, 3, 1, 2)
                 A_test = None
             else:
                 X_test = test_sample['X'].to(device)
