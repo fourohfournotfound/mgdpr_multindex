@@ -22,7 +22,13 @@ from torch.utils.data import DataLoader # Added for DataLoader optimization
 from dataset.graph_dataset_gen import MyDataset # Corrected import
 from model.Multi_GDNN import MGDPR
 from utils.backtesting import run_backtest
-from utils.feature_selection import elasticnet_select, graces_select
+from utils.feature_selection import (
+    elasticnet_select,
+    graces_select,
+    boruta_shap_select,
+    tft_select,
+    dygformer_select,
+)
 
 # Configure the device for running the model on GPU or CPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -36,8 +42,14 @@ parser.add_argument('--pin_memory', type=lambda x: (str(x).lower() == 'true'), d
 parser.add_argument('--use_amp', type=lambda x: (str(x).lower() == 'true'), default=True, help='Enable Automatic Mixed Precision (AMP) training (True/False).')
 parser.add_argument('--top_features', type=int, default=20,
                     help='Number of top features to keep after feature selection.')
-parser.add_argument('--feature_selector', type=str, default='enet', choices=['enet', 'graces'],
-                    help='Feature selection method to use (elastic net or graces).')
+parser.add_argument(
+    '--feature_selector',
+    type=str,
+    default='enet',
+    choices=['enet', 'graces', 'boruta', 'tft', 'dygformer'],
+    help='Feature selection method to use (elastic net, graces, boruta_shap, ' 
+         'tft, or dygformer).',
+)
 
 # Profiler arguments
 parser.add_argument('--profile', type=lambda x: (str(x).lower() == 'true'), default=False, help='Enable PyTorch profiler (True/False).')
@@ -290,6 +302,24 @@ else:
 
         if args.feature_selector == 'graces':
             ranking = graces_select(
+                log1p_training_features_np,
+                target_vec,
+                k=len(features_to_scale_columns),
+            )
+        elif args.feature_selector == 'boruta':
+            ranking = boruta_shap_select(
+                log1p_training_features_np,
+                target_vec,
+                k=len(features_to_scale_columns),
+            )
+        elif args.feature_selector == 'tft':
+            ranking = tft_select(
+                log1p_training_features_np,
+                target_vec,
+                k=len(features_to_scale_columns),
+            )
+        elif args.feature_selector == 'dygformer':
+            ranking = dygformer_select(
                 log1p_training_features_np,
                 target_vec,
                 k=len(features_to_scale_columns),
