@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader # Added for DataLoader optimization
 from dataset.graph_dataset_gen import MyDataset # Corrected import
 from model.Multi_GDNN import MGDPR
 from utils.backtesting import run_backtest
-from utils.graces import graces_select
+from utils.feature_selection import elasticnet_select, graces_select
 
 # Configure the device for running the model on GPU or CPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -34,7 +34,10 @@ parser.add_argument('--batch_size', type=int, default=32, help='Batch size for D
 parser.add_argument('--num_workers', type=int, default=os.cpu_count() // 2 if os.cpu_count() else 4, help='Number of worker processes for data loading.')
 parser.add_argument('--pin_memory', type=lambda x: (str(x).lower() == 'true'), default=True, help='Pin memory for faster CPU to GPU data transfer (True/False).')
 parser.add_argument('--use_amp', type=lambda x: (str(x).lower() == 'true'), default=True, help='Enable Automatic Mixed Precision (AMP) training (True/False).')
-parser.add_argument('--top_features', type=int, default=20, help='Number of top features to keep using GRACES feature selection.')
+parser.add_argument('--top_features', type=int, default=20,
+                    help='Number of top features to keep after feature selection.')
+parser.add_argument('--feature_selector', type=str, default='enet', choices=['enet', 'graces'],
+                    help='Feature selection method to use (elastic net or graces).')
 
 # Profiler arguments
 parser.add_argument('--profile', type=lambda x: (str(x).lower() == 'true'), default=False, help='Enable PyTorch profiler (True/False).')
@@ -274,8 +277,7 @@ else:
         fitted_scaler = scaler
         print("StandardScaler fitted on log1p-transformed training data features.")
 
-        # Compute GRACES feature ranking on the training period
-        # Target: volatility-adjusted returns z-scored per day
+        # Target for feature selection: volatility-adjusted returns z-scored per day
         vol_adj = df_for_scaling_train_period['DailyReturn'].values / (
             df_for_scaling_train_period['Volatility_20d'].values + 1e-9
         )
@@ -285,19 +287,28 @@ else:
             lambda x: (x - x.mean()) / (x.std(ddof=0) if x.std(ddof=0) > 1e-8 else 1.0)
         )
         target_vec = temp_df['z'].fillna(0.0).values
-        graces_ranking = graces_select(
-            log1p_training_features_np,
-            target_vec,
-            k=len(features_to_scale_columns),
-        )
-        top_k = min(args.top_features, len(graces_ranking))
-        selected_feature_idx = graces_ranking[:top_k]
-        print(
-            f"GRACES selected top {top_k} feature indices: {selected_feature_idx}"
-        )
+
+        if args.feature_selector == 'graces':
+            ranking = graces_select(
+                log1p_training_features_np,
+                target_vec,
+                k=len(features_to_scale_columns),
+            )
+        else:
+            ranking = elasticnet_select(
+                log1p_training_features_np,
+                target_vec,
+                k=len(features_to_scale_columns),
+            )
+
+        top_k = min(args.top_features, len(ranking))
+        selected_feature_idx = ranking[:top_k]
+        print(f"Selected top {top_k} feature indices via {args.feature_selector}: {selected_feature_idx}")
 
 # --- Main Dataset Instantiation (passing the fitted_scaler) ---
-print("Initializing training dataset with scaler and GRACES-selected features...")
+print(
+    f"Initializing training dataset with scaler and {args.feature_selector}-selected features..."
+)
 train_dataset = MyDataset(
     root_data_dir,
     graph_dest_dir,
@@ -310,7 +321,9 @@ train_dataset = MyDataset(
     scaler=fitted_scaler,
     selected_features=selected_feature_idx,
 )
-print("Initializing validation dataset with scaler and GRACES-selected features...")
+print(
+    f"Initializing validation dataset with scaler and {args.feature_selector}-selected features..."
+)
 validation_dataset = MyDataset(
     root_data_dir,
     graph_dest_dir,
@@ -323,7 +336,9 @@ validation_dataset = MyDataset(
     scaler=fitted_scaler,
     selected_features=selected_feature_idx,
 )
-print("Initializing test dataset with scaler and GRACES-selected features...")
+print(
+    f"Initializing test dataset with scaler and {args.feature_selector}-selected features..."
+)
 test_dataset = MyDataset(
     root_data_dir,
     graph_dest_dir,
