@@ -586,8 +586,8 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
     """
     if use_mtgnn:
         # X_mtgnn is stored as (Batch, NumNodes, Window, Features)
-        # MTGNN expects input in (Batch, NumNodes, Features, Window)
-        X = batch_sample['X_mtgnn'].to(device).permute(0, 1, 3, 2)
+        # MTGNN expects input in (Batch, Features, NumNodes, Window)
+        X = batch_sample['X_mtgnn'].to(device).permute(0, 3, 1, 2)
         A = None
     else:
         X = batch_sample['X'].to(device)
@@ -897,8 +897,8 @@ for epoch in range(epochs):
             for i_val, val_sample in enumerate(val_loader):
                 if args.model.lower() == 'mtgnn':
                     # Stored as (Batch, NumNodes, Window, Features)
-                    # Convert to (Batch, NumNodes, Features, Window) for MTGNN
-                    X_val = val_sample['X_mtgnn'].to(device).permute(0, 1, 3, 2)
+                    # Convert to (Batch, Features, NumNodes, Window) for MTGNN
+                    X_val = val_sample['X_mtgnn'].to(device).permute(0, 3, 1, 2)
                     A_val = None
                 else:
                     X_val = val_sample['X'].to(device)
@@ -1020,8 +1020,8 @@ else:
         for i_test, test_sample in enumerate(test_loader):
             if args.model.lower() == 'mtgnn':
                 # Stored as (Batch, NumNodes, Window, Features)
-                # Convert to (Batch, NumNodes, Features, Window) for MTGNN
-                X_test = test_sample['X_mtgnn'].to(device).permute(0, 1, 3, 2)
+                # Convert to (Batch, Features, NumNodes, Window) for MTGNN
+                X_test = test_sample['X_mtgnn'].to(device).permute(0, 3, 1, 2)
                 A_test = None
             else:
                 X_test = test_sample['X'].to(device)
