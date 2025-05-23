@@ -148,7 +148,8 @@ def _mp_worker_graph_generation_task(
             label_dist_str = ", ".join([f"Label {l.item()}: {c.item()}" for l, c in zip(unique_labels, counts)])
             print(f"  Label Distribution for graph {i_graph_idx}: {label_dist_str}")
 
-        torch.save({'X': X_processed, 'A': A_adj, 'Y': C_labels}, graph_file_path)
+        X_mtgnn = X_processed.permute(1, 2, 0).float()
+        torch.save({'X': X_processed, 'A': A_adj, 'Y': C_labels, 'X_mtgnn': X_mtgnn}, graph_file_path)
         return i_graph_idx, "success", graph_file_path
     except Exception as e:
         # Log error or handle as appropriate
