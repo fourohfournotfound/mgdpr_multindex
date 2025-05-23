@@ -9,7 +9,7 @@ class MultiReDiffusion(torch.nn.Module):
     This layer refines graph structures by learning task-optimal edges adaptively.
     Corresponds to Section 4.2 of the paper.
     """
-    def __init__(self, input_dim: int, output_dim: int, num_relation: int):
+    def __init__(self, input_dim: int, output_dim: int, num_relation: int, edge_init_density: float = 0.25):
         """
         Args:
             input_dim (int): Feature dimension of the input node representations (H_{l-1}).
@@ -28,6 +28,9 @@ class MultiReDiffusion(torch.nn.Module):
         self.update_layer = torch.nn.Conv2d(num_relation, num_relation, kernel_size=1)
         self.activation1 = torch.nn.PReLU() # sigma after Conv2d
         self.activation0 = torch.nn.PReLU() # sigma after W_l^r H_{l-1}
+
+        # Learnable edge masks for sparsification
+        self.edge_masks = nn.Parameter(edge_init_density * torch.ones(num_relation, 1, 1))
 
     def forward(self, theta_param: torch.Tensor, t_param: torch.Tensor, a_input_batched: torch.Tensor, x_input_batched: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -105,9 +108,13 @@ class MultiReDiffusion(torch.nn.Module):
         # t_p_exp will have shape (1, R, E, N_data, N_data)
         t_p_exp = t_param_normalized.unsqueeze(0)
         
+        # Apply learnable edge masks before diffusion
+        mask = torch.sigmoid(self.edge_masks)  # (R,1,1)
+        a_masked = a_input_batched * mask
+
         # a_input_batched already has N_data as its node dimensions.
         # a_in_b_exp will have shape (B, R, 1, N_data, N_data)
-        a_in_b_exp = a_input_batched.unsqueeze(2)
+        a_in_b_exp = a_masked.unsqueeze(2)
 
         # Element-wise product for terms to be summed over Expansion_Steps (dim=2)
         # theta_p_exp: (1, R, E, 1, 1)
@@ -516,12 +523,15 @@ class MGDPR(nn.Module):
         # print(f"D_gamma sample (first 5x5):\n{D_gamma_tensor[:5,:5]}") # For debugging
 
         self.diffusion_layers = nn.ModuleList(
-            # diffusion_config is [in0, out0, in1, out1, ...]
-            # Each MultiReDiffusion layer corresponds to an MGDPR block.
-            # The number of such blocks is self.layers.
-            # The number of pairs in diffusion_config should be self.layers.
-            [MultiReDiffusion(diffusion_config[2*i], diffusion_config[2*i + 1], num_relation)
-             for i in range(len(diffusion_config) // 2)]
+            [
+                MultiReDiffusion(
+                    diffusion_config[2 * i],
+                    diffusion_config[2 * i + 1],
+                    num_relation,
+                    edge_init_density=0.25,
+                )
+                for i in range(len(diffusion_config) // 2)
+            ]
         )
         # Ensure the number of created diffusion layers matches self.layers
         if len(self.diffusion_layers) != self.layers:
@@ -688,8 +698,16 @@ class MGDPR(nn.Module):
         
         # Sum these absolute differences over all layers and relations
         total_reg_loss = torch.sum(abs_diff_from_one)
-        
+
         return total_reg_loss
+
+    def get_edge_mask_l1_loss(self):
+        """L1 regularization for learnable edge masks."""
+        loss = torch.tensor(0.0, device=self.T.device if hasattr(self, 'T') else 'cpu')
+        for layer in self.diffusion_layers:
+            if hasattr(layer, 'edge_masks'):
+                loss = loss + torch.sum(torch.abs(torch.sigmoid(layer.edge_masks)))
+        return loss
 
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.T)

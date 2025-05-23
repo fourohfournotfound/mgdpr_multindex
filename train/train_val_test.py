@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader # Added for DataLoader optimization
 from dataset.graph_dataset_gen import MyDataset # Corrected import
 from model.Multi_GDNN import MGDPR
 from utils.backtesting import run_backtest
+from utils.graces import graces_select
 
 # Configure the device for running the model on GPU or CPU
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -248,6 +249,7 @@ df_for_scaling_train_period = df_for_scaling[(dates_in_df >= train_start_dt) & (
 if df_for_scaling_train_period.empty:
     print("WARNING: No data found in the training period to fit the scaler. Global scaling will not be applied.")
     fitted_scaler = None
+    selected_feature_idx = None
 else:
     features_to_scale_columns = ['Open', 'High', 'Low', 'Close', 'Volume'] # These are the 5 features
     training_features_np = df_for_scaling_train_period[features_to_scale_columns].values
@@ -255,6 +257,7 @@ else:
     if training_features_np.size == 0:
         print("WARNING: Extracted training features for scaling are empty. Global scaling will not be applied.")
         fitted_scaler = None
+        selected_feature_idx = list(range(len(features_to_scale_columns)))
     else:
         # Apply log1p transformation, similar to how it's done per window before scaling
         log1p_training_features_np = np.log1p(training_features_np)
@@ -265,16 +268,61 @@ else:
         fitted_scaler = scaler
         print("StandardScaler fitted on log1p-transformed training data features.")
 
+        # Compute GRACES feature ranking on the training period
+        # Target: volatility-adjusted returns z-scored per day
+        vol_adj = df_for_scaling_train_period['DailyReturn'].values / (
+            df_for_scaling_train_period['Volatility_20d'].values + 1e-9
+        )
+        temp_df = pd.DataFrame({'Date': df_for_scaling_train_period.index.get_level_values('Date'),
+                                'val': vol_adj})
+        temp_df['z'] = temp_df.groupby('Date')['val'].transform(
+            lambda x: (x - x.mean()) / (x.std(ddof=0) if x.std(ddof=0) > 1e-8 else 1.0)
+        )
+        target_vec = temp_df['z'].fillna(0.0).values
+        selected_feature_idx = graces_select(log1p_training_features_np, target_vec,
+                                             k=len(features_to_scale_columns))
+        print(f"GRACES selected features: {selected_feature_idx}")
+
 # --- Main Dataset Instantiation (passing the fitted_scaler) ---
-print("Initializing training dataset with scaler...")
-train_dataset = MyDataset(root_data_dir, graph_dest_dir, current_market, target_com_list,
-                          train_sedate[0], train_sedate[1], window_size, dataset_types[0], scaler=fitted_scaler)
-print("Initializing validation dataset with scaler...")
-validation_dataset = MyDataset(root_data_dir, graph_dest_dir, current_market, target_com_list,
-                               val_sedate[0], val_sedate[1], window_size, dataset_types[1], scaler=fitted_scaler)
-print("Initializing test dataset with scaler...")
-test_dataset = MyDataset(root_data_dir, graph_dest_dir, current_market, target_com_list,
-                         test_sedate[0], test_sedate[1], window_size, dataset_types[2], scaler=fitted_scaler)
+print("Initializing training dataset with scaler and GRACES-selected features...")
+train_dataset = MyDataset(
+    root_data_dir,
+    graph_dest_dir,
+    current_market,
+    target_com_list,
+    train_sedate[0],
+    train_sedate[1],
+    window_size,
+    dataset_types[0],
+    scaler=fitted_scaler,
+    selected_features=selected_feature_idx,
+)
+print("Initializing validation dataset with scaler and GRACES-selected features...")
+validation_dataset = MyDataset(
+    root_data_dir,
+    graph_dest_dir,
+    current_market,
+    target_com_list,
+    val_sedate[0],
+    val_sedate[1],
+    window_size,
+    dataset_types[1],
+    scaler=fitted_scaler,
+    selected_features=selected_feature_idx,
+)
+print("Initializing test dataset with scaler and GRACES-selected features...")
+test_dataset = MyDataset(
+    root_data_dir,
+    graph_dest_dir,
+    current_market,
+    target_com_list,
+    test_sedate[0],
+    test_sedate[1],
+    window_size,
+    dataset_types[2],
+    scaler=fitted_scaler,
+    selected_features=selected_feature_idx,
+)
 
 # --- DataLoader Instantiation ---
 # Wrap datasets with DataLoader for batching, shuffling, and parallel loading.
@@ -311,6 +359,7 @@ if num_companies == 0:
 model_feature_len = window_size # This is the actual length of the feature vector per node/relation from X
 # d_layers, num_relation, m_gamma, diffusion_steps = 6, 5, 2.5e-4, 7 # Old line
 d_layers, num_relation, regularization_gamma, diffusion_steps = 5, 5, 2.5e-4, 7 # Renamed m_gamma, Set d_layers to 5
+edge_mask_lambda = 5e-4  # L1 penalty for learnable edge masks
 retention_decay_zeta = 0.9 # Using a proper decay value (0 < zeta < 1) as per troubleshooting.md and RetNet principles
 
 # Note: `gamma` in notebook was 2.5e-4, renamed to regularization_gamma.
@@ -629,6 +678,7 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
             
             # Add theta regularization loss
             theta_reg_loss = model.get_theta_regularization_loss()
+            mask_l1_loss = model.get_edge_mask_l1_loss()
             
             # The regularization_gamma is already defined in the script (e.g., 2.5e-4)
             # It's accessible via model.regularization_gamma if it was stored there,
@@ -637,10 +687,10 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
             # If not, it should be passed to train_batch or accessed via model.
             # The MGDPR model stores it as self.regularization_gamma.
             
+            loss = listfold_loss
             if model.regularization_gamma is not None:
-                loss = listfold_loss + model.regularization_gamma * theta_reg_loss
-            else:
-                loss = listfold_loss # No regularization if gamma is None
+                loss = loss + model.regularization_gamma * theta_reg_loss
+            loss = loss + edge_mask_lambda * mask_l1_loss
         
     # <<< End of torch.amp.autocast block >>>
 
