@@ -311,6 +311,7 @@ if num_companies == 0:
 model_feature_len = window_size # This is the actual length of the feature vector per node/relation from X
 # d_layers, num_relation, m_gamma, diffusion_steps = 6, 5, 2.5e-4, 7 # Old line
 d_layers, num_relation, regularization_gamma, diffusion_steps = 5, 5, 2.5e-4, 7 # Renamed m_gamma, Set d_layers to 5
+edge_mask_lambda = 5e-4  # L1 penalty for learnable edge masks
 retention_decay_zeta = 0.9 # Using a proper decay value (0 < zeta < 1) as per troubleshooting.md and RetNet principles
 
 # Note: `gamma` in notebook was 2.5e-4, renamed to regularization_gamma.
@@ -629,6 +630,7 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
             
             # Add theta regularization loss
             theta_reg_loss = model.get_theta_regularization_loss()
+            mask_l1_loss = model.get_edge_mask_l1_loss()
             
             # The regularization_gamma is already defined in the script (e.g., 2.5e-4)
             # It's accessible via model.regularization_gamma if it was stored there,
@@ -637,10 +639,10 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
             # If not, it should be passed to train_batch or accessed via model.
             # The MGDPR model stores it as self.regularization_gamma.
             
+            loss = listfold_loss
             if model.regularization_gamma is not None:
-                loss = listfold_loss + model.regularization_gamma * theta_reg_loss
-            else:
-                loss = listfold_loss # No regularization if gamma is None
+                loss = loss + model.regularization_gamma * theta_reg_loss
+            loss = loss + edge_mask_lambda * mask_l1_loss
         
     # <<< End of torch.amp.autocast block >>>
 
