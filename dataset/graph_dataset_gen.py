@@ -61,7 +61,7 @@ def _mp_worker_graph_generation_task(
                 # Access pre-calculated DailyReturn and Volatility_20d from the main DataFrame
                 # These are for the target_date_dt (t+1)
                 # DailyReturn at t+1 is (Close_t+1 - Close_t) / Close_t
-                # Volatility_20d at t+1 is std_dev of DailyReturns up to t+1 (using returns from t-18 to t+1)
+                # Volatility_20d for target_date_dt (t+1) is calculated using DailyReturns up to the previous day (t).
                 next_day_return = my_dataset_instance.stock_data_df.loc[(company_ticker, target_date_dt), 'DailyReturn']
                 volatility = my_dataset_instance.stock_data_df.loc[(company_ticker, target_date_dt), 'Volatility_20d']
 
@@ -319,11 +319,12 @@ class MyDataset(Dataset):
                 # Calculate 20-day rolling volatility of daily returns
                 # min_periods=20 ensures that we only get a value if there are 20 data points,
                 # effectively making volatility NaN for initial periods with insufficient data.
-                vol_series = self.stock_data_df.groupby(level='Ticker', group_keys=False)['DailyReturn'].apply(lambda x: x.rolling(window=20, min_periods=20).std())
+                # Shift(1) ensures that volatility for day t+1 is based on returns up to day t.
+                vol_series = self.stock_data_df.groupby(level='Ticker', group_keys=False)['DailyReturn'].apply(lambda x: x.rolling(window=20, min_periods=20).std().shift(1))
                 self.stock_data_df['Volatility_20d'] = vol_series
                 
                 # Note: 'DailyReturn' will have NaN for the first entry of each stock.
-                # 'Volatility_20d' will have NaNs for the first 19 (actual data) entries of each stock.
+                # 'Volatility_20d' will have NaNs for the first 20 data entries of each stock (19 from rolling, 1 from shift).
                 # These NaNs are expected and will be handled during target calculation in the worker.
             else:
                 # If stock_data_df is empty, create empty columns to prevent KeyErrors later
@@ -340,6 +341,14 @@ class MyDataset(Dataset):
             raise
 
         self.dates, self.next_day = self.find_dates(self.start_str, self.end_str, self.comlist)
+
+        # Store dates_for_graph_gen for use in __getitem__
+        self.dates_for_graph_gen_stored = []
+        if self.dates: # Ensure self.dates is not empty
+            self.dates_for_graph_gen_stored = list(self.dates) # Make a copy
+            if self.next_day and self.next_day not in self.dates_for_graph_gen_stored and len(self.dates_for_graph_gen_stored) >= self.window:
+                self.dates_for_graph_gen_stored.append(self.next_day)
+            self.dates_for_graph_gen_stored.sort() # Ensure sorted order
         
         graph_dir_name = f'{self.market}_{self.dataset_type}_{self.start_str}_{self.end_str}_{self.window}'
         self.graph_directory_path = os.path.abspath(os.path.join(self.desti, graph_dir_name))
@@ -411,6 +420,29 @@ class MyDataset(Dataset):
         
         try:
             graph_data = torch.load(data_path)
+            
+            # Add target_date_str and original_ticker_order to the sample
+            target_date_str_for_sample = "UNKNOWN_DATE" # Default
+            if hasattr(self, 'dates_for_graph_gen_stored') and self.dates_for_graph_gen_stored:
+                # The target date for graph 'idx' is the (idx + window_size)-th date in dates_for_graph_gen_stored
+                # This corresponds to the last date in the (window_size + 1) slice used to create graph 'idx'
+                # dates_for_graph_gen_stored[i_graph_idx : i_graph_idx + window_size + 1]
+                # The last element of this slice is dates_for_graph_gen_stored[i_graph_idx + window_size]
+                target_date_lookup_idx = idx + self.window
+                if 0 <= target_date_lookup_idx < len(self.dates_for_graph_gen_stored):
+                    target_date_str_for_sample = self.dates_for_graph_gen_stored[target_date_lookup_idx]
+                else:
+                    # This case should ideally not happen if _actual_len is correct
+                    # and dates_for_graph_gen_stored covers all possible target dates.
+                    # print(f"Warning: MyDataset.__getitem__({idx}): target_date_lookup_idx {target_date_lookup_idx} out of bounds for dates_for_graph_gen_stored (len {len(self.dates_for_graph_gen_stored)}).")
+                    pass # Keep UNKNOWN_DATE or handle error
+            else:
+                # print(f"Warning: MyDataset.__getitem__({idx}): self.dates_for_graph_gen_stored not available or empty.")
+                pass
+
+            graph_data['target_date_str'] = target_date_str_for_sample
+            graph_data['original_ticker_order'] = self.comlist # self.comlist is the list of tickers for this dataset split
+
             return graph_data
         except FileNotFoundError:
             print(f"ERROR MyDataset.__getitem__({idx}): File not found at {data_path}.")
