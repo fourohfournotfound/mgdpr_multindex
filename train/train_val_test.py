@@ -34,6 +34,10 @@ parser.add_argument('--num_workers', type=int, default=os.cpu_count() // 2 if os
 parser.add_argument('--pin_memory', type=lambda x: (str(x).lower() == 'true'), default=True, help='Pin memory for faster CPU to GPU data transfer (True/False).')
 parser.add_argument('--use_amp', type=lambda x: (str(x).lower() == 'true'), default=True, help='Enable Automatic Mixed Precision (AMP) training (True/False).')
 
+parser.add_argument('--feature-selection', type=str, default=None,
+                    choices=['boruta', 'hsic', 'enet', 'online'],
+                    help='Optional feature selection method to apply.')
+
 # Profiler arguments
 parser.add_argument('--profile', type=lambda x: (str(x).lower() == 'true'), default=False, help='Enable PyTorch profiler (True/False).')
 parser.add_argument('--profile-steps', type=int, default=5, help='Number of active steps/batches for the profiler to record.')
@@ -227,8 +231,17 @@ print("Preparing to fit StandardScaler on training data features...")
 # Create a temporary dataset instance for the training period to access its loaded and processed stock_data_df
 # This dataset instance itself won't be used for training, only for fitting the scaler.
 # No scaler is passed to it.
-temp_train_dataset_for_scaler = MyDataset(root_data_dir, graph_dest_dir, current_market, target_com_list,
-                                          train_sedate[0], train_sedate[1], window_size, "ScalerFitTemp")
+temp_train_dataset_for_scaler = MyDataset(
+    root_data_dir,
+    graph_dest_dir,
+    current_market,
+    target_com_list,
+    train_sedate[0],
+    train_sedate[1],
+    window_size,
+    "ScalerFitTemp",
+    selected_features=['Open', 'High', 'Low', 'Close', 'Volume'],
+)
 
 # Access the stock_data_df which is indexed by ('Ticker', 'Date')
 # and contains 'Open', 'High', 'Low', 'Close', 'Volume' columns.
@@ -245,12 +258,14 @@ train_end_dt = pd.to_datetime(train_sedate[1])
 dates_in_df = df_for_scaling.index.get_level_values('Date')
 df_for_scaling_train_period = df_for_scaling[(dates_in_df >= train_start_dt) & (dates_in_df <= train_end_dt)]
 
+# Default feature list for scaling and optional selection
+selected_feature_list = ['Open', 'High', 'Low', 'Close', 'Volume']
+
 if df_for_scaling_train_period.empty:
     print("WARNING: No data found in the training period to fit the scaler. Global scaling will not be applied.")
     fitted_scaler = None
 else:
-    features_to_scale_columns = ['Open', 'High', 'Low', 'Close', 'Volume'] # These are the 5 features
-    training_features_np = df_for_scaling_train_period[features_to_scale_columns].values
+    training_features_np = df_for_scaling_train_period[selected_feature_list].values
 
     if training_features_np.size == 0:
         print("WARNING: Extracted training features for scaling are empty. Global scaling will not be applied.")
@@ -265,16 +280,67 @@ else:
         fitted_scaler = scaler
         print("StandardScaler fitted on log1p-transformed training data features.")
 
+        # Optional feature selection
+        fs_method = args.feature_selection
+        if fs_method:
+            from utils.feature_selection import walk_forward_selector
+            try:
+                y_series = df_for_scaling_train_period['DailyReturn'].fillna(0)
+                dates_series = df_for_scaling_train_period.index.get_level_values('Date')
+                fs_gen = walk_forward_selector(
+                    df_for_scaling_train_period[selected_feature_list],
+                    y_series,
+                    dates_series,
+                    method=fs_method,
+                    window=min(len(dates_series), 750),
+                    step=20,
+                    top_k=len(selected_feature_list),
+                )
+                selected_feature_list = next(fs_gen)[2]
+                print(f"Using selected features via {fs_method}: {selected_feature_list}")
+            except Exception as e:
+                print(f"Feature selection failed with {fs_method}: {e}. Using all features.")
+
 # --- Main Dataset Instantiation (passing the fitted_scaler) ---
 print("Initializing training dataset with scaler...")
-train_dataset = MyDataset(root_data_dir, graph_dest_dir, current_market, target_com_list,
-                          train_sedate[0], train_sedate[1], window_size, dataset_types[0], scaler=fitted_scaler)
+train_dataset = MyDataset(
+    root_data_dir,
+    graph_dest_dir,
+    current_market,
+    target_com_list,
+    train_sedate[0],
+    train_sedate[1],
+    window_size,
+    dataset_types[0],
+    scaler=fitted_scaler,
+    selected_features=selected_feature_list,
+)
 print("Initializing validation dataset with scaler...")
-validation_dataset = MyDataset(root_data_dir, graph_dest_dir, current_market, target_com_list,
-                               val_sedate[0], val_sedate[1], window_size, dataset_types[1], scaler=fitted_scaler)
+validation_dataset = MyDataset(
+    root_data_dir,
+    graph_dest_dir,
+    current_market,
+    target_com_list,
+    val_sedate[0],
+    val_sedate[1],
+    window_size,
+    dataset_types[1],
+    scaler=fitted_scaler,
+    selected_features=selected_feature_list,
+)
 print("Initializing test dataset with scaler...")
-test_dataset = MyDataset(root_data_dir, graph_dest_dir, current_market, target_com_list,
-                         test_sedate[0], test_sedate[1], window_size, dataset_types[2], scaler=fitted_scaler)
+test_dataset = MyDataset(
+    root_data_dir,
+    graph_dest_dir,
+    current_market,
+    target_com_list,
+    test_sedate[0],
+    test_sedate[1],
+    window_size,
+    dataset_types[2],
+    scaler=fitted_scaler,
+    selected_features=selected_feature_list,
+)
 
 # --- DataLoader Instantiation ---
 # Wrap datasets with DataLoader for batching, shuffling, and parallel loading.

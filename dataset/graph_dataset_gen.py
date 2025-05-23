@@ -176,7 +176,7 @@ class MyDataset(Dataset):
     
     The dataset uses multiprocessing for efficient graph generation if files are missing or incomplete.
     """
-    def __init__(self, root_csv_path: str, desti: str, market: str, comlist: List[str], start: str, end: str, window: int, dataset_type: str, scaler=None):
+    def __init__(self, root_csv_path: str, desti: str, market: str, comlist: List[str], start: str, end: str, window: int, dataset_type: str, scaler=None, selected_features: List[str] | None = None):
         """
         Initializes the dataset, loads stock data, and triggers graph generation if needed.
 
@@ -193,6 +193,9 @@ class MyDataset(Dataset):
             window (int): Lookback window size (tau in paper) for constructing graph features.
             dataset_type (str): Type of dataset (e.g., "Train", "Validation", "Test"). Used for naming.
             scaler (sklearn.preprocessing.StandardScaler, optional): Fitted scaler for features. Defaults to None.
+            selected_features (List[str] | None, optional): Subset of columns to
+                use as node features. If ``None``, defaults to
+                ``["Open", "High", "Low", "Close", "Volume"]``.
         """
         print("--- DEBUG: MyDataset __init__ ENTERED ---") # Very simple debug print
         super().__init__()
@@ -206,7 +209,9 @@ class MyDataset(Dataset):
         self.window = window
         self.dataset_type = dataset_type
         self.scaler = scaler
-        self.feature_dim = 5 # Number of primary features (O,H,L,C,V) to be scaled
+        default_features = ['Open', 'High', 'Low', 'Close', 'Volume']
+        self.selected_features = selected_features if selected_features else default_features
+        self.feature_dim = len(self.selected_features)
         
         # Load the CSV and prepare the MultiIndex DataFrame
         try:
@@ -582,9 +587,9 @@ class MyDataset(Dataset):
         
         return A
 
-    def node_feature_matrix(self, window_dates_str: List[str], comlist_arg: List[str], market: str) -> torch.Tensor: # Renamed comlist to comlist_arg
-        num_features = 5
-        feature_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+    def node_feature_matrix(self, window_dates_str: List[str], comlist_arg: List[str], market: str) -> torch.Tensor:  # Renamed comlist to comlist_arg
+        feature_columns = self.selected_features
+        num_features = len(feature_columns)
         num_companies = len(comlist_arg)
         num_days_in_window = len(window_dates_str)
         zero_X_tensor = torch.zeros((num_features, num_companies, num_days_in_window), dtype=torch.float32)

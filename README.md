@@ -10,3 +10,7 @@ default it runs the Boruta-SHAP algorithm on each training window, but HSIC-Lass
 elastic-net with exponential forgetting or simple online selectors can also be
 used.  Only the training slice is seen by the selector so validation leakage is
 avoided.
+
+`train/train_val_test.py` exposes a `--feature-selection` argument so these
+methods can be invoked when preparing graph datasets.  Selected columns are
+passed to `MyDataset` via its new `selected_features` parameter.
