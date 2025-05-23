@@ -21,6 +21,8 @@ from torch.utils.data import DataLoader # Added for DataLoader optimization
 
 from dataset.graph_dataset_gen import MyDataset # Corrected import
 from model.Multi_GDNN import MGDPR
+from model.mtgnn import MTGNN # Your custom MTGNN
+from pytorch_geometric_temporal.nn.recurrent import MTGNN as PTG_MTGNN # PyTorch Geometric Temporal MTGNN
 from utils.backtesting import run_backtest
 
 # Configure the device for running the model on GPU or CPU
@@ -33,6 +35,22 @@ parser.add_argument('--batch_size', type=int, default=32, help='Batch size for D
 parser.add_argument('--num_workers', type=int, default=os.cpu_count() // 2 if os.cpu_count() else 4, help='Number of worker processes for data loading.')
 parser.add_argument('--pin_memory', type=lambda x: (str(x).lower() == 'true'), default=True, help='Pin memory for faster CPU to GPU data transfer (True/False).')
 parser.add_argument('--use_amp', type=lambda x: (str(x).lower() == 'true'), default=True, help='Enable Automatic Mixed Precision (AMP) training (True/False).')
+parser.add_argument('--model', type=str, default='mgdpr', choices=['mgdpr', 'mtgnn', 'ptg_mtgnn'], help='Model type to train (mgdpr, mtgnn, ptg_mtgnn).')
+
+# PTG_MTGNN specific arguments (add sensible defaults or mark as required if no default)
+parser.add_argument('--ptg_gcn_depth', type=int, default=2, help="GCN depth for PTG_MTGNN")
+parser.add_argument('--ptg_dropout', type=float, default=0.3, help="Dropout rate for PTG_MTGNN")
+parser.add_argument('--ptg_subgraph_size', type=int, default=20, help="Subgraph size for PTG_MTGNN adaptive adj matrix")
+parser.add_argument('--ptg_node_dim', type=int, default=40, help="Node embedding dimension for PTG_MTGNN adaptive adj matrix")
+parser.add_argument('--ptg_dilation_exponential', type=int, default=2, help="Dilation exponential for PTG_MTGNN TCN")
+parser.add_argument('--ptg_conv_channels', type=int, default=32, help="Convolution channels for PTG_MTGNN TCN")
+parser.add_argument('--ptg_residual_channels', type=int, default=32, help="Residual channels for PTG_MTGNN TCN")
+parser.add_argument('--ptg_skip_channels', type=int, default=64, help="Skip channels for PTG_MTGNN TCN")
+parser.add_argument('--ptg_end_channels', type=int, default=128, help="End channels for PTG_MTGNN TCN")
+parser.add_argument('--ptg_mtgnn_layers', type=int, default=3, help="Number of MTGNN blocks/layers for PTG_MTGNN")
+parser.add_argument('--ptg_propalpha', type=float, default=0.05, help="Alpha for mix-hop propagation in PTG_MTGNN")
+parser.add_argument('--ptg_tanhalpha', type=float, default=3.0, help="Alpha for tanh in PTG_MTGNN adaptive adj matrix")
+# Note: in_dim, seq_length, num_nodes, out_dim for PTG_MTGNN will be derived from data/other args.
 
 # Profiler arguments
 parser.add_argument('--profile', type=lambda x: (str(x).lower() == 'true'), default=False, help='Enable PyTorch profiler (True/False).')
@@ -465,12 +483,83 @@ for l_idx in range(d_layers):
     current_fc_input_dim = fc_output_dim
 
 
-print(f"DEBUG: About to instantiate MGDPR. num_companies = {num_companies}")
-print(f"DEBUG: MGDPR args: d_layers={d_layers}, num_nodes (from num_companies)={num_companies}, model_feature_len={model_feature_len}, num_relation={num_relation}, expansion_steps={diffusion_steps}")
+# Initialize feature dimension variables with defaults
+in_feat_mtgnn = 0 # Default for custom MTGNN, will be updated if selected
+# ptg_in_dim will be defined within its own block if train_dataset is not empty
 
-model = MGDPR(actual_diffusion_config, retention_config, ret_linear_1_config, ret_linear_2_config, mlp_config,
-              d_layers, num_companies, model_feature_len, num_relation, retention_decay_zeta, diffusion_steps, regularization_gamma_param=regularization_gamma) # Pass retention_decay_zeta and optional regularization_gamma
-model = model.to(device)
+print(f"DEBUG: About to instantiate model {args.model}")
+if args.model.lower() == 'mtgnn':
+    # This is your custom MTGNN
+    sample0 = train_dataset[0]
+    # Assuming X_mtgnn from your dataset is (num_nodes, window_size, num_features_per_node)
+    # and your custom MTGNN expects in_feat as num_features_per_node
+    in_feat_mtgnn = sample0['X_mtgnn'].shape[2] # num_features_per_node
+    model = MTGNN(num_nodes=num_companies, in_feat=in_feat_mtgnn, layers=4, hidden=96).to(device)
+    print(f"Instantiated custom MTGNN model.")
+elif args.model.lower() == 'ptg_mtgnn':
+    # This is PyTorch Geometric Temporal MTGNN
+    # It expects X_in: (batch_size, in_dim, num_nodes, seq_len)
+    # MyDataset provides 'X' as (in_dim, num_nodes, seq_len)
+    # in_dim is number of features (e.g., 5 for O,H,L,C,V)
+    # num_nodes is num_companies
+    # seq_len is window_size
+    
+    # Get in_dim from the first sample of the dataset (should be consistent)
+    # 'X' from MyDataset has shape (num_features, num_companies, window_size)
+    # So, ptg_in_dim is X.shape[0]
+    if len(train_dataset) > 0:
+        sample0_ptg = train_dataset[0]
+        ptg_in_dim = sample0_ptg['X'].shape[0] # num_input_features (e.g., 5)
+    else:
+        # Fallback if dataset is empty, though this should be caught earlier
+        # This value should ideally come from a config or be asserted.
+        print("Warning: Training dataset is empty. Attempting to use default in_dim=5 for PTG_MTGNN.")
+        ptg_in_dim = 5
+
+
+    ptg_seq_length = window_size # window_size is already defined
+    ptg_num_nodes = num_companies # num_companies is already defined
+    ptg_out_dim = 1 # For single-step prediction of a single score per node
+
+    print(f"DEBUG: PTG_MTGNN params: build_adj=True, gcn_depth={args.ptg_gcn_depth}, num_nodes={ptg_num_nodes}, "
+          f"kernel_set (example), kernel_size (example), dropout={args.ptg_dropout}, subgraph_size={min(ptg_num_nodes, args.ptg_subgraph_size)}, "
+          f"node_dim={args.ptg_node_dim}, dilation_exponential={args.ptg_dilation_exponential}, "
+          f"conv_channels={args.ptg_conv_channels}, residual_channels={args.ptg_residual_channels}, "
+          f"skip_channels={args.ptg_skip_channels}, end_channels={args.ptg_end_channels}, "
+          f"seq_length={ptg_seq_length}, in_dim={ptg_in_dim}, out_dim={ptg_out_dim}, layers={args.ptg_mtgnn_layers}, "
+          f"propalpha={args.ptg_propalpha}, tanhalpha={args.ptg_tanhalpha}")
+
+    model = PTG_MTGNN(
+        gcn_true=True, # Standard for MTGNN
+        build_adj=True,  # Let the model learn the adjacency matrix
+        gcn_depth=args.ptg_gcn_depth,
+        num_nodes=ptg_num_nodes,
+        kernel_set=[2, 3, 3, 2], # Example kernel set, make configurable if needed
+        kernel_size=7,          # Example kernel size, make configurable if needed
+        dropout=args.ptg_dropout,
+        subgraph_size=min(ptg_num_nodes, args.ptg_subgraph_size), # Ensure subgraph_size <= num_nodes
+        node_dim=args.ptg_node_dim,
+        dilation_exponential=args.ptg_dilation_exponential,
+        conv_channels=args.ptg_conv_channels,
+        residual_channels=args.ptg_residual_channels,
+        skip_channels=args.ptg_skip_channels,
+        end_channels=args.ptg_end_channels,
+        seq_length=ptg_seq_length,
+        in_dim=ptg_in_dim,
+        out_dim=ptg_out_dim,
+        layers=args.ptg_mtgnn_layers,
+        propalpha=args.ptg_propalpha,
+        tanhalpha=args.ptg_tanhalpha,
+        layer_norm_affline=True # Example, make configurable if needed
+        # xd is for static features, not used here.
+    ).to(device)
+    print(f"Instantiated PyTorch Geometric Temporal MTGNN model.")
+else: # Default to MGDPR (original custom model)
+    print(f"DEBUG: MGDPR args: d_layers={d_layers}, num_nodes (from num_companies)={num_companies}, model_feature_len={model_feature_len}, num_relation={num_relation}, expansion_steps={diffusion_steps}")
+    model = MGDPR(actual_diffusion_config, retention_config, ret_linear_1_config, ret_linear_2_config, mlp_config,
+                  d_layers, num_companies, model_feature_len, num_relation, retention_decay_zeta, diffusion_steps, regularization_gamma_param=regularization_gamma)
+    model = model.to(device)
+    print(f"Instantiated custom MGDPR model.")
 
 # --- Optimizer and Objective Function ---
 optimizer = torch.optim.AdamW(model.parameters(), lr=2.5e-4) # Reverted to paper's learning rate
@@ -574,13 +663,38 @@ if PROFILE_ENABLED and not os.path.exists(PROFILER_LOG_DIR):
 
 # Helper function for a single training step to avoid code duplication
 # profiler_context argument removed as prof.step() is handled by schedule, and record_function is global
-def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_amp, is_profiling=False):
+def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_amp, is_profiling=False, use_mtgnn=False, expected_model_features=5): # Added expected_model_features
     """
     Processes a single batch of training data.
     """
-    X = batch_sample['X'].to(device)
-    X = batch_sample['X'].to(device)
-    A = batch_sample['A'].to(device)
+    if use_mtgnn:
+        # X_mtgnn is stored as (Batch, NumNodes, Window, Features)
+        # MTGNN expects input in (Batch, NumNodes, Features, Window)
+        
+        # --- BEGIN ADDED DEBUG ---
+        actual_features_in_batch_X_mtgnn = batch_sample['X_mtgnn'].shape[3]
+        if actual_features_in_batch_X_mtgnn != expected_model_features:
+            print(f"DEBUG train_batch: Feature mismatch in source X_mtgnn!")
+            print(f"  Expected features (model configured for): {expected_model_features}")
+            print(f"  Actual features in this batch (X_mtgnn.shape[3]): {actual_features_in_batch_X_mtgnn}")
+            print(f"  Shape of batch_sample['X_mtgnn']: {batch_sample['X_mtgnn'].shape}")
+        # --- END ADDED DEBUG ---
+
+        X = batch_sample['X_mtgnn'].to(device).permute(0, 1, 3, 2) # Shape: (B, N_from_pt, F_from_pt, W_from_pt)
+        
+        # --- BEGIN ADDED DEBUG for X after permute ---
+        # X.shape[2] is the feature dimension that will be treated as 'channels' by the model's internal permute for Conv2d
+        features_in_X_to_model = X.shape[2]
+        if features_in_X_to_model != expected_model_features:
+            print(f"DEBUG train_batch: Feature mismatch in permuted X (input to model)!")
+            print(f"  Expected features (model configured for): {expected_model_features}")
+            print(f"  Actual features in X.shape[2]: {features_in_X_to_model}")
+            print(f"  Shape of X (permuted, to model): {X.shape}")
+        # --- END ADDED DEBUG for X after permute ---
+        A = None
+    else:
+        X = batch_sample['X'].to(device)
+        A = batch_sample['A'].to(device)
     # C_labels are now the true z-scored vol-adjusted returns (continuous)
     # Shape: (Batch_Size, Num_Nodes)
     C_target_scores = batch_sample['Y'].float().to(device)
@@ -591,10 +705,9 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
     with torch.amp.autocast('cuda', enabled=use_amp):
         if is_profiling:
             with record_function("model_forward"):
-                # Model output is now (Batch_Size, Num_Nodes, 1)
-                out_predicted_scores_raw = model(X, A)
+                out_predicted_scores_raw = model(X) if A is None else model(X, A)
         else:
-            out_predicted_scores_raw = model(X, A)
+            out_predicted_scores_raw = model(X) if A is None else model(X, A)
         
         # Squeeze the last dimension to get (Batch_Size, Num_Nodes)
         out_predicted_scores = out_predicted_scores_raw.squeeze(-1)
@@ -676,7 +789,8 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
     return loss, out_predicted_scores, C_target_scores, sample_has_valid_target
 
 epochs = 3 # Reduced for quick testing, notebook uses 10000
-model.reset_parameters()
+if hasattr(model, 'reset_parameters'):
+    model.reset_parameters()
 
 # --- AMP Scaler ---
 use_amp_flag = args.use_amp and torch.cuda.is_available() and device.type == 'cuda'
@@ -741,7 +855,9 @@ for epoch in range(epochs):
                 
                 # train_batch now returns: loss, out_predicted_scores, C_target_scores, sample_has_valid_target
                 current_loss, _, _, _ = train_batch(
-                    sample, model, criterion, optimizer, device, scaler, use_amp_flag, is_profiling=True
+                    sample, model, criterion, optimizer, device, scaler, use_amp_flag,
+                    is_profiling=True, use_mtgnn=(args.model.lower() == 'mtgnn'),
+                    expected_model_features=in_feat_mtgnn
                 )
                 
                 epoch_loss_sum += current_loss.item() # current_loss is already a scalar
@@ -829,7 +945,9 @@ for epoch in range(epochs):
                 # train_batch now returns: loss, out_predicted_scores, C_target_scores, sample_has_valid_target
                 # Unpack correctly, using current_loss for the loss value
                 current_loss, _out_predicted_scores, _C_target_scores, _sample_has_valid_target = train_batch(
-                    sample, model, criterion, optimizer, device, scaler, use_amp_flag, is_profiling=False
+                    sample, model, criterion, optimizer, device, scaler, use_amp_flag,
+                    is_profiling=False, use_mtgnn=(args.model.lower() == 'mtgnn'),
+                    expected_model_features=in_feat_mtgnn
                 )
                 
                 epoch_loss_sum += current_loss.item()
@@ -842,7 +960,9 @@ for epoch in range(epochs):
             # train_batch now returns: loss, out_predicted_scores, C_target_scores, sample_has_valid_target
             # Unpack correctly, using current_loss for the loss value
             current_loss, _out_predicted_scores, _C_target_scores, _sample_has_valid_target = train_batch(
-                sample, model, criterion, optimizer, device, scaler, use_amp_flag, is_profiling=False
+                sample, model, criterion, optimizer, device, scaler, use_amp_flag,
+                is_profiling=False, use_mtgnn=(args.model.lower() == 'mtgnn'),
+                expected_model_features=in_feat_mtgnn
             )
             
             epoch_loss_sum += current_loss.item()
@@ -881,12 +1001,18 @@ for epoch in range(epochs):
 
         with torch.no_grad():
             for i_val, val_sample in enumerate(val_loader):
-                X_val = val_sample['X'].to(device)
-                A_val = val_sample['A'].to(device)
+                if args.model.lower() == 'mtgnn':
+                    # Stored as (Batch, NumNodes, Window, Features)
+                    # Convert to (Batch, NumNodes, Features, Window) for MTGNN
+                    X_val = val_sample['X_mtgnn'].to(device).permute(0, 1, 3, 2)
+                    A_val = None
+                else:
+                    X_val = val_sample['X'].to(device)
+                    A_val = val_sample['A'].to(device)
                 C_val_target_scores = val_sample['Y'].float().to(device) # True scores
                 
                 with torch.amp.autocast('cuda', enabled=use_amp_flag):
-                    out_val_predicted_scores_raw = model(X_val, A_val) # (Batch, Nodes, 1)
+                    out_val_predicted_scores_raw = model(X_val) if A_val is None else model(X_val, A_val)
                 
                 out_val_predicted_scores = out_val_predicted_scores_raw.squeeze(-1) # (Batch, Nodes)
 
@@ -998,14 +1124,29 @@ if len(test_loader) == 0:
 else:
     with torch.no_grad():
         for i_test, test_sample in enumerate(test_loader):
-            X_test = test_sample['X'].to(device)
-            A_test = test_sample['A'].to(device)
+            A_test = None # Default
+            if args.model.lower() == 'mtgnn': # Custom MTGNN
+                X_test = test_sample['X_mtgnn'].to(device).permute(0, 1, 3, 2)
+            elif args.model.lower() == 'ptg_mtgnn': # PTG_MTGNN
+                X_test = test_sample['X'].to(device)
+            else: # MGDPR
+                X_test = test_sample['X'].to(device)
+                A_test = test_sample['A'].to(device)
             C_test_target_scores = test_sample['Y'].float().to(device)
             
             with torch.amp.autocast('cuda', enabled=use_amp_flag):
-                out_test_predicted_scores_raw = model(X_test, A_test) # (Batch, Nodes, 1)
-            
-            out_test_predicted_scores = out_test_predicted_scores_raw.squeeze(-1) # (Batch, Nodes)
+                if args.model.lower() == 'ptg_mtgnn':
+                    out_test_predicted_scores_raw = model(X_test, A_tilde=None, idx=None, FE=None)
+                else:
+                    out_test_predicted_scores_raw = model(X_test) if A_test is None else model(X_test, A_test)
+
+            if args.model.lower() == 'ptg_mtgnn':
+                if out_test_predicted_scores_raw.shape[1] == 1 and out_test_predicted_scores_raw.shape[3] == 1:
+                    out_test_predicted_scores = out_test_predicted_scores_raw.squeeze(3).squeeze(1)
+                else:
+                    out_test_predicted_scores = out_test_predicted_scores_raw[:, 0, :, 0]
+            else:
+                out_test_predicted_scores = out_test_predicted_scores_raw.squeeze(-1)
 
             # Filter for loss calculation
             test_sample_has_valid_target = torch.any(~torch.isnan(C_test_target_scores), dim=1)
