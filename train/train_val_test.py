@@ -51,9 +51,9 @@ args = parser.parse_args()
 # Date ranges for training, validation, and testing
 # TODO: IMPORTANT - Update these date ranges to match your dataset's actual time coverage!
 # Example: If your data is from 2018 to 2023
-train_sedate = ['2019-01-01', '2021-12-31'] # Replace with your actual training start and end dates
-val_sedate = ['2022-01-01', '2022-12-31']   # Replace with your actual validation start and end dates
-test_sedate = ['2023-01-01', '2023-12-31']  # Replace with your actual test start and end dates
+train_sedate = ['2021-01-01', '2022-12-31'] # Replace with your actual training start and end dates
+val_sedate = ['2022-01-01', '2023-12-31']   # Replace with your actual validation start and end dates
+test_sedate = ['2024-01-01', '2025-04-21']  # Replace with your actual test start and end dates
 
 # Market and dataset types
 market_names = ['NASDAQ', 'NYSE', 'SSE'] # Example markets from notebook
@@ -74,7 +74,7 @@ com_list_csv_paths = [
 # Root directory for individual stock data CSVs (e.g., market_ticker_30Y.csv)
 # MyDataset expects files like: os.path.join(root_data_dir, f'{market}_{ticker}_30Y.csv')
 # TODO: Update this path to your local raw stock data CSV file
-root_data_dir = "/workspaces/ai_testground/shortlist_stocks-1.csv" # Path to the single stock data CSV file
+root_data_dir = "/workspaces/ai_testground/05_08_25_bitfinex_data_filtered.csv" # Path to the single stock data CSV file
 
 # Destination directory for generated graph .pt files
 # MyDataset will create subfolders like: os.path.join(graph_dest_dir, f'{market}_{type}_{start}_{end}_{window}')
@@ -675,7 +675,7 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
 
     return loss, out_predicted_scores, C_target_scores, sample_has_valid_target
 
-epochs = 20 # Reduced for quick testing, notebook uses 10000
+epochs = 3 # Reduced for quick testing, notebook uses 10000
 model.reset_parameters()
 
 # --- AMP Scaler ---
