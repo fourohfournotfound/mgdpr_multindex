@@ -5,6 +5,18 @@ try:
 except Exception:  # sklearn might not be available
     f_regression = None
 
+try:
+    from BorutaShap import BorutaShap  # type: ignore
+    import lightgbm as lgb  # type: ignore
+except Exception:  # BorutaShap or lightgbm might not be available
+    BorutaShap = None  # type: ignore
+    lgb = None  # type: ignore
+
+try:
+    import torch
+except Exception:  # PyTorch is optional for gating selectors
+    torch = None
+
 
 def graces_select(X, y, k=10, noise_std=0.01, random_state=None):
     """Select top ``k`` features using a simplified GRACES routine.
@@ -106,3 +118,107 @@ def elasticnet_select(
     ranking = np.argsort(np.abs(coef))[::-1]
     k = min(k, n_features)
     return ranking[:k].tolist()
+
+
+def boruta_shap_select(
+    X,
+    y,
+    k=10,
+    n_estimators=350,
+    percentile=70,
+    classification=False,
+    verbose=False,
+):
+    """Feature ranking using the Boruta-Shap wrapper around LightGBM.
+
+    This method requires the ``BorutaShap`` and ``lightgbm`` packages. If they
+    are not available an ``ImportError`` is raised.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Feature matrix ``(n_samples, n_features)``.
+    y : np.ndarray
+        Target vector.
+    k : int, optional
+        Number of top features to return. If ``None``, all confirmed features
+        are returned.
+    n_estimators : int, optional
+        Number of trees for the LightGBM model used inside Boruta-Shap.
+    percentile : float, optional
+        Percentile threshold for feature confirmation.
+    classification : bool, optional
+        Whether to perform classification rather than regression.
+    verbose : bool, optional
+        Verbosity flag forwarded to Boruta-Shap.
+
+    Returns
+    -------
+    list[int]
+        Indices of the selected features sorted by importance.
+    """
+    if BorutaShap is None or lgb is None:
+        raise ImportError(
+            "BorutaShap and lightgbm are required for boruta_shap_select"
+        )
+
+    model = lgb.LGBMRegressor(n_estimators=n_estimators)
+    selector = BorutaShap(
+        model=model,
+        importance_measure="shap",
+        classification=classification,
+        percentile=percentile,
+        verbose=verbose,
+        train_or_test="test",
+    )
+    selector.fit(X, y, sample=False, allow_str=False)
+    ranks = np.asarray(selector.ranking)
+    order = np.argsort(ranks)
+    if k is not None:
+        order = order[:k]
+    return order.tolist()
+
+
+def _gate_select(X, y, k=10, hidden_dim=32, epochs=20, lr=0.01):
+    """Internal helper implementing a small gating network with PyTorch."""
+    if torch is None:
+        raise ImportError(
+            "PyTorch is required for tft_select and dygformer_select"
+        )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    X_t = torch.tensor(X, dtype=torch.float32, device=device)
+    y_t = torch.tensor(y, dtype=torch.float32, device=device).view(-1, 1)
+
+    gate = torch.nn.Linear(X_t.shape[1], X_t.shape[1], bias=False)
+    net = torch.nn.Sequential(
+        gate,
+        torch.nn.Softmax(dim=1),
+        torch.nn.Linear(X_t.shape[1], hidden_dim),
+        torch.nn.ReLU(),
+        torch.nn.Linear(hidden_dim, 1),
+    ).to(device)
+
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    for _ in range(int(epochs)):
+        opt.zero_grad()
+        preds = net(X_t)
+        loss = torch.nn.functional.mse_loss(preds, y_t)
+        loss.backward()
+        opt.step()
+
+    importance = gate.weight.abs().sum(0).detach().cpu().numpy()
+    ranking = np.argsort(importance)[::-1]
+    k = min(k, X_t.shape[1])
+    return ranking[:k].tolist()
+
+
+def tft_select(X, y, k=10, hidden_dim=32, epochs=20, lr=0.01):
+    """Select features via a lightweight TFT-style gating mechanism."""
+    return _gate_select(X, y, k, hidden_dim, epochs, lr)
+
+
+def dygformer_select(X, y, k=10, hidden_dim=32, epochs=20, lr=0.01):
+    """Select features via a lightweight DyGFormer-style gating mechanism."""
+    return _gate_select(X, y, k, hidden_dim, epochs, lr)
+
