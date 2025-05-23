@@ -236,7 +236,9 @@ class MyDataset(Dataset):
         self.dataset_type = dataset_type
         self.scaler = scaler
         self.selected_features = selected_features
-        self.feature_dim = 5 # Number of primary features (O,H,L,C,V) to be scaled
+        # feature_dim and feature_columns will be determined after loading the CSV
+        self.feature_dim = 0
+        self.feature_columns: List[str] = []
         
         # Load the CSV and prepare the MultiIndex DataFrame
         try:
@@ -250,16 +252,26 @@ class MyDataset(Dataset):
                     looks_like_data = True
             
             expected_column_names = ['Ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-            # user_example_cols defines the full potential set of columns if the headerless CSV is wide.
-            # We will only use the ones in expected_column_names.
-            user_example_cols = ['Ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'AdjClose', 'OriginalDate1', 'OriginalDate2']
+            # user_example_cols defines a potential set of columns if the CSV is headerless.
+            # When using a headerless file we only guarantee these names for the
+            # first few columns, but we still load all remaining columns so that
+            # additional features are preserved.
+            user_example_cols = [
+                'Ticker', 'Date', 'Open', 'High', 'Low', 'Close', 'Volume',
+                'AdjClose', 'OriginalDate1', 'OriginalDate2'
+            ]
 
             if looks_like_data:
-                # If headerless, provide names for all potential columns in user_example_cols,
-                # but only load those specified in expected_column_names.
-                # This assumes the order of columns in expected_column_names matches the
-                # first N columns of user_example_cols if the CSV is headerless.
-                raw_df = pd.read_csv(self.root_csv_path, header=None, names=user_example_cols, usecols=expected_column_names, low_memory=False)
+                # If the CSV appears to be headerless we still want to preserve
+                # any additional columns beyond the expected ones.  Read the
+                # entire file first, then assign names to the known columns.
+                temp_df = pd.read_csv(self.root_csv_path, header=None, low_memory=False)
+                col_count = temp_df.shape[1]
+                default_names = user_example_cols[:col_count]
+                if col_count > len(user_example_cols):
+                    default_names += [f'ExtraCol{i}' for i in range(col_count - len(user_example_cols))]
+                temp_df.columns = default_names
+                raw_df = temp_df
             else:
                 raw_df = pd.read_csv(self.root_csv_path, low_memory=False)
                 rename_map = {}
@@ -294,10 +306,8 @@ class MyDataset(Dataset):
 
             
             raw_df = raw_df.loc[:, ~raw_df.columns.duplicated(keep='first')]
-            # Now, self.stock_data_df will be created from raw_df.
-            # If `usecols` was used for headerless, raw_df already contains only the expected columns.
-            # If it was a headed CSV, raw_df might have more columns, and we select expected_column_names.
-            self.stock_data_df = raw_df[expected_column_names].copy()
+            # Preserve all columns to allow additional features beyond the expected set.
+            self.stock_data_df = raw_df.copy()
 
 
             try:
@@ -311,13 +321,12 @@ class MyDataset(Dataset):
             self.stock_data_df = self.stock_data_df.dropna(subset=['Ticker', 'Date'])
             self.stock_data_df = self.stock_data_df[self.stock_data_df['Ticker'].isin(self.comlist)] 
 
-            numeric_cols_to_convert = ['Open', 'High', 'Low', 'Close', 'Volume']
-            if self.stock_data_df.empty: 
-                raise ValueError(f"No valid data remaining for comlist: {self.comlist} from {self.root_csv_path} (DataFrame became empty before numeric conversion loop).")
-
-            for _col_check in numeric_cols_to_convert:
-                if _col_check not in self.stock_data_df.columns:
-                    raise ValueError(f"CRITICAL PRE-CHECK MyDataset: Column '{_col_check}' not found in DataFrame before numeric conversion. Columns are: {self.stock_data_df.columns.tolist()}")
+            numeric_cols_to_convert = [c for c in self.stock_data_df.columns if c not in ['Ticker', 'Date']]
+            mandatory_cols = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume'] if c in self.stock_data_df.columns]
+            if self.stock_data_df.empty:
+                raise ValueError(
+                    f"No valid data remaining for comlist: {self.comlist} from {self.root_csv_path} (DataFrame became empty before numeric conversion loop)."
+                )
 
             for col_to_convert in numeric_cols_to_convert:
                 if col_to_convert in self.stock_data_df:
@@ -327,11 +336,20 @@ class MyDataset(Dataset):
                             self.stock_data_df[col_to_convert] = pd.to_numeric(column_data_slice, errors='coerce')
                         elif isinstance(column_data_slice, pd.DataFrame):
                             if not column_data_slice.empty:
-                                self.stock_data_df[col_to_convert] = pd.to_numeric(column_data_slice.iloc[:, 0], errors='coerce')
+                                self.stock_data_df[col_to_convert] = pd.to_numeric(
+                                    column_data_slice.iloc[:, 0], errors='coerce'
+                                )
                     except Exception as e_slice_convert:
-                        print(f"ERROR MyDataset: Exception during slice or pd.to_numeric for column '{col_to_convert}': {e_slice_convert}")
-            
-            self.stock_data_df = self.stock_data_df.dropna(subset=numeric_cols_to_convert)
+                        print(
+                            f"ERROR MyDataset: Exception during slice or pd.to_numeric for column '{col_to_convert}': {e_slice_convert}"
+                        )
+
+            if mandatory_cols:
+                self.stock_data_df = self.stock_data_df.dropna(subset=mandatory_cols)
+
+            # Fill remaining NaNs in other feature columns with zeros
+            non_index_cols = [c for c in self.stock_data_df.columns if c not in ['Ticker', 'Date']]
+            self.stock_data_df[non_index_cols] = self.stock_data_df[non_index_cols].fillna(0.0)
 
             if self.stock_data_df.empty:
                 raise ValueError(f"No valid data remaining after numeric conversion and NaN drop for comlist: {self.comlist} from {self.root_csv_path}")
@@ -352,7 +370,7 @@ class MyDataset(Dataset):
                 # Shift(1) ensures that volatility for day t+1 is based on returns up to day t.
                 vol_series = self.stock_data_df.groupby(level='Ticker', group_keys=False)['DailyReturn'].apply(lambda x: x.rolling(window=20, min_periods=20).std().shift(1))
                 self.stock_data_df['Volatility_20d'] = vol_series
-                
+
                 # Note: 'DailyReturn' will have NaN for the first entry of each stock.
                 # 'Volatility_20d' will have NaNs for the first 20 data entries of each stock (19 from rolling, 1 from shift).
                 # These NaNs are expected and will be handled during target calculation in the worker.
@@ -361,6 +379,11 @@ class MyDataset(Dataset):
                 # if other parts of the code expect these columns to exist.
                 self.stock_data_df['DailyReturn'] = pd.Series(dtype=float)
                 self.stock_data_df['Volatility_20d'] = pd.Series(dtype=float)
+            # Determine available feature columns (exclude label-related columns)
+            self.feature_columns = [
+                c for c in self.stock_data_df.columns if c not in ['Ticker', 'Date', 'DailyReturn', 'Volatility_20d']
+            ]
+            self.feature_dim = len(self.feature_columns)
             # --- END: New code for target variable calculation prerequisites ---
 
         except FileNotFoundError:
@@ -619,9 +642,9 @@ class MyDataset(Dataset):
         
         return A
 
-    def node_feature_matrix(self, window_dates_str: List[str], comlist_arg: List[str], market: str) -> torch.Tensor: # Renamed comlist to comlist_arg
-        num_features = 5
-        feature_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+    def node_feature_matrix(self, window_dates_str: List[str], comlist_arg: List[str], market: str) -> torch.Tensor:  # Renamed comlist to comlist_arg
+        feature_columns = self.feature_columns
+        num_features = len(feature_columns)
         num_companies = len(comlist_arg)
         num_days_in_window = len(window_dates_str)
         zero_X_tensor = torch.zeros((num_features, num_companies, num_days_in_window), dtype=torch.float32)
