@@ -347,9 +347,11 @@ train_dataset = MyDataset(
     train_sedate[0],
     train_sedate[1],
     window_size,
-    dataset_types[0],
+    "ScalerFitTemp",  # reuse pre-generated graphs
     scaler=fitted_scaler,
     selected_features=selected_feature_idx,
+    apply_scaler_on_load=True,
+    skip_graph_generation=True,
 )
 print(
     f"Initializing validation dataset with scaler and {args.feature_selector}-selected features..."
