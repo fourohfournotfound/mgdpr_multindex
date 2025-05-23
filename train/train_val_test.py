@@ -74,7 +74,7 @@ com_list_csv_paths = [
 # Root directory for individual stock data CSVs (e.g., market_ticker_30Y.csv)
 # MyDataset expects files like: os.path.join(root_data_dir, f'{market}_{ticker}_30Y.csv')
 # TODO: Update this path to your local raw stock data CSV file
-root_data_dir = "/workspaces/ai_testground/05_06_25_sectoretf_filtered_and_aligned.csv" # Path to the single stock data CSV file
+root_data_dir = "/workspaces/ai_testground/shortlist_stocks-1.csv" # Path to the single stock data CSV file
 
 # Destination directory for generated graph .pt files
 # MyDataset will create subfolders like: os.path.join(graph_dest_dir, f'{market}_{type}_{start}_{end}_{window}')
@@ -379,16 +379,15 @@ else: # d_layers == 0, should not happen
 # So eta per node has (mfl * retention_config[3*l+2]) / num_companies features.
 eta_feature_dims_per_node = []
 for i in range(d_layers):
-  if (3 * i + 2) < len(retention_config):
-      pr_out_dim = retention_config[3 * i + 2] # This is out_dim for ParallelRetention's QKV block
-      # eta_dim_per_node = (mfl * pr_out_dim) / nc # This was the previous logic
-      # The output of ParallelRetention.forward is output_x.view(num_node_original_from_x, -1)
-      # output_x is (self.time_dim, self.out_dim) = (mfl, pr_out_dim)
-      # So, view(nc, (mfl * pr_out_dim) / nc). The feature dim is (mfl * pr_out_dim) / nc
+  if (3 * i + 1) < len(retention_config): # Check against inter_dim index
+      pr_inter_dim = retention_config[3 * i + 1] # This is inter_dim for ParallelRetention, now its effective output feature base
+      # The output of ParallelRetention.forward is effectively (time_dim, inter_dim) before node-wise reshaping.
+      # Reshaped per node, features become (time_dim * inter_dim) / num_nodes.
+      # So, view(nc, (mfl * pr_inter_dim) / nc). The feature dim is (mfl * pr_inter_dim) / nc.
       # This must be an integer.
-      calculated_eta_feat_dim = (mfl * pr_out_dim) / nc
+      calculated_eta_feat_dim = (mfl * pr_inter_dim) / nc
       if calculated_eta_feat_dim != int(calculated_eta_feat_dim):
-          print(f"ERROR: Calculated eta feature dimension for layer {i} is not an integer: {calculated_eta_feat_dim}. This indicates a config problem.")
+          print(f"ERROR: Calculated eta feature dimension for layer {i} (using pr_inter_dim={pr_inter_dim}) is not an integer: {calculated_eta_feat_dim}. This indicates a config problem.")
           # This is a critical error. The dimensions must result in an integer number of features.
           # Defaulting to 0 or pr_out_dim will likely lead to further runtime errors.
           # This suggests retention_config or mfl/nc needs adjustment so (mfl * pr_out_dim) is divisible by nc.
@@ -398,7 +397,7 @@ for i in range(d_layers):
       else:
           eta_feature_dims_per_node.append(int(calculated_eta_feat_dim))
   else:
-      print(f"Error: retention_config is too short for layer {i} to determine eta_feature_dims.")
+      print(f"Error: retention_config is too short for layer {i} to determine ParallelRetention inter_dim for eta_feature_dims.")
       eta_feature_dims_per_node.append(0) # Fallback, will likely cause issues
 
 ret_linear_1_config_list = []
@@ -676,7 +675,7 @@ def train_batch(batch_sample, model, criterion, optimizer, device, scaler, use_a
 
     return loss, out_predicted_scores, C_target_scores, sample_has_valid_target
 
-epochs = 10 # Reduced for quick testing, notebook uses 10000
+epochs = 20 # Reduced for quick testing, notebook uses 10000
 model.reset_parameters()
 
 # --- AMP Scaler ---
